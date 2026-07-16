@@ -29,12 +29,14 @@ class TaskQueue:
 
     async def add_task(self, task_id: int, creator_id: int, task_type: str, payload: dict) -> None:
         """Pushes a raw task configuration onto the execution queue."""
-        # Ensure the structural format matches the worker unpack expectations perfectly
         await self.queue.put((task_id, creator_id, task_type, payload))
         logger.info(f"Task #{task_id} loaded into RAM queue.")
 
-    async def start_worker(self) -> None:
-        """Continuous listener loop that runs pending actions."""
+    async def start_worker(self, *args, **kwargs) -> None:
+        """
+        Continuous listener loop that runs pending actions.
+        Accepts *args and **kwargs to safely ingest configuration flags passed by main.py.
+        """
         logger.info("Initializing Task Queue daemon worker...")
         while True:
             try:
@@ -225,5 +227,5 @@ class TaskQueue:
 # ==========================================
 # EXPORT GLOBAL INSTANCE FOR MAIN.PY
 # ==========================================
-# We instantiate the engine here so that main.py gets a true shared TaskQueue instance.
+# We instantiate the engine here so that main.py safely uses a unified run loop.
 task_engine = TaskQueue()
