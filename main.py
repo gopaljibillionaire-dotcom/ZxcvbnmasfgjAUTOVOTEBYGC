@@ -744,8 +744,7 @@ async def finalize_task_creation(message: Message, state: FSMContext):
         data["msg_id"] = link_msg_id
 
     task_id = await db_mgr.create_task(user_id, task_type, data)
-    await task_engine.add_task(task_id, user_id, task_type, data)
-
+    await task_engine.add_task(task_id=task_id, creator_id=user_id, type=task_type, payload=data)
     await db_mgr.execute_write("INSERT INTO logs (user_id, action) VALUES (?, ?)", (user_id, f"Queued task #{task_id}"))
     
     extra_details = ""
