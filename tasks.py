@@ -214,3 +214,10 @@ class TaskQueue:
             f"🟢 **Successes:** `{len(success_phones)}`\n"
             f"🔴 **Failures:** `{len(failure_phones)}`"
         )
+
+
+# ==========================================
+# EXPORT FIX FOR MAIN.PY
+# ==========================================
+# Maps the 'TaskQueue' class to 'task_engine' to resolve the ImportError in main.py
+task_engine = TaskQueue
