@@ -83,7 +83,6 @@ def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
 async def make_accounts_keyboard(user_id: int, role: str) -> InlineKeyboardMarkup:
     keyboard_layout = []
     
-    # Super-owners extract complete global topology, others pull matching contextual records
     if role == "super_owner":
         rows = await db_mgr.execute_read_all("SELECT phone, user_id, username FROM accounts WHERE status = 'active'")
     else:
@@ -104,7 +103,6 @@ async def make_accounts_keyboard(user_id: int, role: str) -> InlineKeyboardMarku
         ])
 
     keyboard_layout.append([InlineKeyboardButton(text="➕ Link via OTP (Phone)", callback_data="add_account_phone")])
-    # Open session uploads to all validated actors per business rules requirement
     keyboard_layout.append([InlineKeyboardButton(text="📥 Link via Session File", callback_data="add_account_session_file")])
     keyboard_layout.append([InlineKeyboardButton(text="🔙 Back to Main Console", callback_data="main_menu")])
     
@@ -727,19 +725,49 @@ async def process_dm_text(message: Message, state: FSMContext):
 
 async def finalize_task_creation(message: Message, state: FSMContext):
     data = await state.get_data()
-    user_id = message.chat.id if isinstance(message, Message) else message.from_user.id
-    task_type = data.pop("task_type")
     
+    # Context-agnostic extractors for runtime compatibility between message types
+    if isinstance(message, Message):
+        user_id = message.chat.id
+        username = message.from_user.username or "Unknown"
+    else:
+        user_id = message.from_user.id
+        username = message.from_user.username or "Unknown"
+        
+    task_type = data.pop("task_type")
     target = data.get("target", "")
     parsed_target, link_msg_id, is_private_hash = parse_telegram_link(target)
     if link_msg_id:
         data["msg_id"] = link_msg_id
 
+    # Create task entries inside core architecture structures
     task_id = await db_mgr.create_task(user_id, task_type, data)
     await task_engine.add_task(task_id, user_id, task_type, data)
 
     await db_mgr.execute_write("INSERT INTO logs (user_id, action) VALUES (?, ?)", (user_id, f"Queued task #{task_id}"))
     
+    # Frame extra parameters dynamically depending on operation types without touching DB schemas
+    extra_details = ""
+    if task_type == "react":
+        mode = data.get("react_mode", "standard")
+        emojis = ", ".join(data.get("reactions", [])) if mode == "standard" else "N/A"
+        extra_details = f"\n▪️ **Strategy Mode:** `{mode}`\n▪️ **Target Emojis:** `{emojis}`"
+    elif task_type == "button_vote":
+        extra_details = f"\n▪️ **Target Button Label:** `{data.get('button_text', 'N/A')}`"
+    elif task_type == "dm":
+        extra_details = f"\n▪️ **Message Contents:** `{data.get('text', 'N/A')}`"
+
+    # Forward comprehensive tactical deployment log directly to the channel via dispatch_log
+    channel_log_payload = (
+        f"⚡ **Automation Pipeline Initialized**\n"
+        f"▪️ **Task Ref Reference:** `#{task_id}`\n"
+        f"▪️ **Action Vector:** `{task_type.upper()}`\n"
+        f"▪️ **Target Channel/Resource:** `{target}`\n"
+        f"▪️ **Triggered By Actor:** @{username} (`{user_id}`)"
+        f"{extra_details}"
+    )
+    await dispatch_log(bot, channel_log_payload)
+
     response = f"🚀 **Task #{task_id} successfully queued!**\nWorkers are executing operations. Reports: `/taskreport_{task_id}`"
     if isinstance(message, Message):
         await message.answer(response)
@@ -753,9 +781,7 @@ async def view_tasks(callback: CallbackQuery):
     user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
     
-    if role == "super_owner":
-        rows = await db_mgr.execute_read_all("SELECT task_id, type, status, progress, creator_id FROM tasks ORDER BY task_id DESC LIMIT 15")
-    elif role in ["admin", "owner"]:
+    if role in ["super_owner", "admin", "owner"]:
         rows = await db_mgr.execute_read_all("SELECT task_id, type, status, progress, creator_id FROM tasks ORDER BY task_id DESC LIMIT 15")
     else:
         rows = await db_mgr.execute_read_all("SELECT task_id, type, status, progress, creator_id FROM tasks WHERE creator_id = ? ORDER BY task_id DESC LIMIT 10", (user_id,))
@@ -794,7 +820,6 @@ async def cmd_task_report(message: Message):
     passed_list = json.loads(success_rep) if success_rep else []
     failed_list = json.loads(failure_rep) if failure_rep else []
 
-    # Identify historical chain index paths for comparative metrics (Task N vs Task N-1)
     prev_row = await db_mgr.execute_read_one("SELECT task_id FROM tasks WHERE task_id < ? ORDER BY task_id DESC LIMIT 1", (task_id,))
     prev_id_str = f"#{prev_row[0]}" if prev_row else "None"
 
@@ -840,10 +865,9 @@ async def handle_abort_task(callback: CallbackQuery):
     
     await callback.message.edit_text(
         f"🛑 **Termination Signal Distributed!**\nTask pipeline `#{task_id}` has been marked as **CANCELLED**.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[[InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu")]]])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu")]])
     )
     
-    # Send comprehensive details to the logging channel
     await dispatch_log(
         bot, 
         f"🛑 **Manual Abort Intercept Executed:**\n"
