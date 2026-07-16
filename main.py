@@ -952,7 +952,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    worker_task = asyncio.create_task(task_engine.start_worker())
+    worker_task = asyncio.create_task(task_engine.start_worker(self))
     
     await dispatch_log(bot, "🚀 **Multi-Account Automation System Core Online.** Operational loops active.")
 
