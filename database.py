@@ -75,25 +75,76 @@ class Database:
             
         logger.info("Database schemas confirmed and loaded successfully.")
 
+    async def _handle_operational_error(self, error: aiosqlite.sqlite3.OperationalError) -> bool:
+        """Internal helper to automatically fix missing columns without crashing."""
+        error_msg = str(error)
+        if "no such column: status" in error_msg:
+            logger.warning("Migration Guard: 'status' column is missing in 'users' or 'accounts' table! Fixing structural layout...")
+            try:
+                async with aiosqlite.connect(self.db_path) as db:
+                    # Attempt altering both tables safely just in case
+                    try:
+                        await db.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'")
+                    except aiosqlite.sqlite3.OperationalError:
+                        pass # Column might already be there in this specific table
+                    
+                    try:
+                        await db.execute("ALTER TABLE accounts ADD COLUMN status TEXT DEFAULT 'active'")
+                    except aiosqlite.sqlite3.OperationalError:
+                        pass
+                        
+                    await db.commit()
+                logger.info("Migration Guard: Column structural updates successfully applied.")
+                return True
+            except Exception as migrate_err:
+                logger.error(f"Migration Guard failed to patch database schema: {migrate_err}")
+        return False
+
     async def execute_write(self, query: str, parameters: tuple = ()) -> int:
         """Helper to run INSERT, UPDATE, DELETE queries safely."""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(query, parameters) as cursor:
-                last_row_id = cursor.lastrowid
-                await db.commit()
-                return last_row_id
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute(query, parameters) as cursor:
+                    last_row_id = cursor.lastrowid
+                    await db.commit()
+                    return last_row_id
+        except aiosqlite.sqlite3.OperationalError as e:
+            if await self._handle_operational_error(e):
+                # Retry transaction once layout modifications settle
+                async with aiosqlite.connect(self.db_path) as db:
+                    async with db.execute(query, parameters) as cursor:
+                        last_row_id = cursor.lastrowid
+                        await db.commit()
+                        return last_row_id
+            raise e
 
     async def execute_read_one(self, query: str, parameters: tuple = ()) -> Optional[Tuple]:
         """Fetch a single record cleanly."""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(query, parameters) as cursor:
-                return await cursor.fetchone()
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute(query, parameters) as cursor:
+                    return await cursor.fetchone()
+        except aiosqlite.sqlite3.OperationalError as e:
+            if await self._handle_operational_error(e):
+                # Retry query execution following structural fix
+                async with aiosqlite.connect(self.db_path) as db:
+                    async with db.execute(query, parameters) as cursor:
+                        return await cursor.fetchone()
+            raise e
 
     async def execute_read_all(self, query: str, parameters: tuple = ()) -> List[Tuple]:
         """Fetch a list of matching database entries."""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(query, parameters) as cursor:
-                return await cursor.fetchall()
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute(query, parameters) as cursor:
+                    return await cursor.fetchall()
+        except aiosqlite.sqlite3.OperationalError as e:
+            if await self._handle_operational_error(e):
+                # Retry query execution following structural fix
+                async with aiosqlite.connect(self.db_path) as db:
+                    async with db.execute(query, parameters) as cursor:
+                        return await cursor.fetchall()
+            raise e
 
     # --- USER ADMINISTRATION QUERIES ---
     async def get_user_role(self, user_id: int) -> str:
