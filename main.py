@@ -27,6 +27,10 @@ from telethon.errors import (
     PasswordHashInvalidError,
     AuthKeyUnregisteredError
 )
+# Telethon specific imports for joining channels and reactions
+from telethon.tl.functions.messages import ImportChatInviteRequest, SendReactionRequest
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.types import ReactionEmoji, ReplyInlineMarkup
 
 # Modular imports
 from config import API_ID, API_HASH, BOT_TOKEN, SUPER_OWNER_IDS
@@ -109,6 +113,43 @@ def get_task_types_keyboard() -> InlineKeyboardMarkup:
 
 router = Router()
 
+# --- TARGET PARSER & AUTOMATION IMPLEMENTATION ---
+async def join_channel_helper(client: TelegramClient, target: str):
+    """
+    Tries joining a public channel or a private channel/chat via invitation link.
+    """
+    clean_target = target.strip()
+    # Check if target is a link
+    if "t.me/" in clean_target or "telegram.dog/" in clean_target:
+        # Extract join hash from private links: t.me/joinchat/hash or t.me/+hash
+        if "/joinchat/" in clean_target or "t.me/+" in clean_target:
+            invite_hash = clean_target.split("/")[-1].replace("+", "").strip()
+            return await client(ImportChatInviteRequest(invite_hash))
+            
+    # Fallback to public channel join
+    return await client(JoinChannelRequest(clean_target))
+
+async def click_inline_button_helper(client: TelegramClient, entity, msg_id: int, button_text: str):
+    """
+    Retrieves the message, scans the inline keyboard elements, and clicks the matching button.
+    """
+    messages = await client.get_messages(entity, ids=[msg_id])
+    if not messages or not messages[0]:
+        raise ValueError("Message not found.")
+        
+    message = messages[0]
+    if not message.reply_markup or not isinstance(message.reply_markup, ReplyInlineMarkup):
+        raise ValueError("This message contains no inline buttons.")
+
+    for row in message.reply_markup.rows:
+        for button in row.buttons:
+            if button_text.strip().lower() in button.text.strip().lower():
+                # Click the match button
+                await message.click(button)
+                return True
+                
+    raise ValueError(f"Button with text '{button_text}' was not found.")
+
 # --- HANDLERS ---
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -144,7 +185,7 @@ async def handle_main_menu(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_main_keyboard(role)
     )
 
-# --- GET SESSION FILE IMPLEMENTATION ---
+# --- GET SESSION FILE ---
 @router.message(Command("getsession"))
 async def cmd_get_session(message: Message):
     user_id = message.from_user.id
@@ -224,7 +265,7 @@ async def cmd_get_session(message: Message):
             except Exception:
                 pass
 
-# --- CANCEL TASK IMPLEMENTATION ---
+# --- CANCEL TASK ---
 @router.message(Command("canceltask"))
 async def cmd_cancel_task(message: Message):
     user_id = message.from_user.id
@@ -773,7 +814,7 @@ async def task_hub_process_type(callback: CallbackQuery, state: FSMContext):
         )
     else:
         await callback.message.edit_text(
-            "🔗 Enter Target Address:\nProvide the Username, Public Link, or Private Invitation Link:"
+            "🔗 Enter Target Address:\nProvide the Username, Public Link, or Private Invitation Link (e.g., t.me/joinchat/... or t.me/+...):"
         )
     await state.set_state(TaskWizardStates.waiting_for_target)
 
