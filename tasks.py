@@ -18,13 +18,18 @@ from helpers import decrypt_data, parse_telegram_link, dispatch_log
 logger = logging.getLogger("TaskWorkerEngine")
 
 class TaskQueue:
-    def __init__(self, bot: Bot):
+    def __init__(self, bot: Bot = None):
         self.bot = bot
         self.queue: asyncio.Queue = asyncio.Queue()
         self.active_workers: Dict[int, asyncio.Task] = {}
 
+    def set_bot(self, bot: Bot) -> None:
+        """Allows dynamic assignment of the bot instance after initialization."""
+        self.bot = bot
+
     async def add_task(self, task_id: int, creator_id: int, task_type: str, payload: dict) -> None:
         """Pushes a raw task configuration onto the execution queue."""
+        # Ensure the structural format matches the worker unpack expectations perfectly
         await self.queue.put((task_id, creator_id, task_type, payload))
         logger.info(f"Task #{task_id} loaded into RAM queue.")
 
@@ -33,6 +38,7 @@ class TaskQueue:
         logger.info("Initializing Task Queue daemon worker...")
         while True:
             try:
+                # Safe fetching from the true asyncio Queue object instance
                 task_id, creator_id, task_type, payload = await self.queue.get()
                 worker = asyncio.create_task(self._execute_task(task_id, creator_id, task_type, payload))
                 self.active_workers[task_id] = worker
@@ -171,7 +177,6 @@ class TaskQueue:
                 
             except FloodWaitError as fwe:
                 failure_phones.append((phone, f"Rate limited: wait {fwe.seconds}s"))
-                # If rate-limiting strikes, wait briefly without locking up the entire system
                 await asyncio.sleep(min(fwe.seconds, 15))
             except Exception as action_ex:
                 failure_phones.append((phone, str(action_ex)))
@@ -204,20 +209,21 @@ class TaskQueue:
         )
 
         # Send execution details to your private audit logging channel
-        await dispatch_log(
-            self.bot,
-            f"📋 **Task Complete Report**\n\n"
-            f"🆔 **Task ID:** `#{task_id}`\n"
-            f"⚙️ **Type:** `{task_type.upper()}`\n"
-            f"👤 **Initiator ID:** `{creator_id}`\n"
-            f"📊 **Final Output:** `{final_progress}`\n"
-            f"🟢 **Successes:** `{len(success_phones)}`\n"
-            f"🔴 **Failures:** `{len(failure_phones)}`"
-        )
+        if self.bot:
+            await dispatch_log(
+                self.bot,
+                f"📋 **Task Complete Report**\n\n"
+                f"🆔 **Task ID:** `#{task_id}`\n"
+                f"⚙️ **Type:** `{task_type.upper()}`\n"
+                f"👤 **Initiator ID:** `{creator_id}`\n"
+                f"📊 **Final Output:** `{final_progress}`\n"
+                f"🟢 **Successes:** `{len(success_phones)}`\n"
+                f"🔴 **Failures:** `{len(failure_phones)}`"
+            )
 
 
 # ==========================================
-# EXPORT FIX FOR MAIN.PY
+# EXPORT GLOBAL INSTANCE FOR MAIN.PY
 # ==========================================
-# Maps the 'TaskQueue' class to 'task_engine' to resolve the ImportError in main.py
-task_engine = TaskQueue
+# We instantiate the engine here so that main.py gets a true shared TaskQueue instance.
+task_engine = TaskQueue()
