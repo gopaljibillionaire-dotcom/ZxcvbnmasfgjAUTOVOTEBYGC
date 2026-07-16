@@ -1,188 +1,132 @@
-"""
-Multi-Account Automation Framework - Persistent Database Engine
-"""
-import sqlite3
-import aiosqlite
-import logging
-import json
 import os
-from typing import Any, Optional, Union, List, Tuple
-import config
+import aiosqlite
 
-logger = logging.getLogger("DatabaseEngine")
-
-class Database:
-    def __init__(self, db_path: str = config.DB_PATH):
+class DatabaseManager:
+    def __init__(self, db_path: str):
         self.db_path = db_path
 
-    async def init(self) -> None:
-        """Initializes tables, indexes, and validates schemas."""
-        logger.info("Initializing connection with core SQLite database...")
+    async def init_db(self):
+        """
+        Ensures the database file exists and sets up tables if they do not exist.
+        Also patches/migrates the table dynamically if the 'status' or 'id_limit' 
+        columns are missing from an older database.
+        """
+        # Create directory path if it doesn't exist
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+
         async with aiosqlite.connect(self.db_path) as db:
-            # Users Table
+            # 1. Create the base 'users' table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    role TEXT DEFAULT 'user', 
-                    max_accounts INTEGER DEFAULT 5,
-                    referred_by INTEGER,
+                    role TEXT DEFAULT 'normal',
                     status TEXT DEFAULT 'active',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    id_limit INTEGER DEFAULT 5
                 )
             """)
-            # Accounts Table (Individual Telegram Sessions)
+
+            # 2. Create the target IDs table for tracking registered target accounts
             await db.execute("""
-                CREATE TABLE IF NOT EXISTS accounts (
-                    phone TEXT PRIMARY KEY,
-                    user_id INTEGER, 
-                    username TEXT,
-                    session_string TEXT,
-                    status TEXT DEFAULT 'active', 
-                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
-                )
-            """)
-            # System Tasks Table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS tasks (
-                    task_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    creator_id INTEGER,
-                    type TEXT, 
-                    payload TEXT, 
-                    status TEXT DEFAULT 'pending', 
-                    progress TEXT DEFAULT '0%',
-                    success_report TEXT DEFAULT '[]',
-                    failure_report TEXT DEFAULT '[]',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            # Security Audit Logs Table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS logs (
+                CREATE TABLE IF NOT EXISTS target_ids (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    action TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    owner_id INTEGER,
+                    target_id TEXT UNIQUE,
+                    FOREIGN KEY(owner_id) REFERENCES users(user_id)
                 )
             """)
-            
-            # Create indexing structures for lightning-fast queries
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_users_id ON users(user_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id)")
-            await db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_creator ON tasks(creator_id)")
             await db.commit()
-            
-        logger.info("Database schemas confirmed and loaded successfully.")
 
-    async def execute_write(self, query: str, parameters: tuple = ()) -> int:
-        """Helper to run INSERT, UPDATE, DELETE queries safely."""
-        async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(query, parameters) as cursor:
-                last_row_id = cursor.lastrowid
+            # 3. MIGRATION CHECK: Safe verification of columns (prevents future "no such column" errors)
+            async with db.execute("PRAGMA table_info(users)") as cursor:
+                columns = [row[1] for row in await cursor.fetchall()]
+                
+            if 'status' not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active';")
                 await db.commit()
-                return last_row_id
+                print("Migration: Added 'status' column to users table.")
 
-    async def execute_read_one(self, query: str, parameters: tuple = ()) -> Optional[Tuple]:
-        """Fetch a single record cleanly."""
+            if 'id_limit' not in columns:
+                await db.execute("ALTER TABLE users ADD COLUMN id_limit INTEGER DEFAULT 5;")
+                await db.commit()
+                print("Migration: Added 'id_limit' column to users table.")
+
+    async def get_user_role(self, user_id: int) -> dict:
+        """Retrieves user's role, status, and target ID limit."""
         async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(query, parameters) as cursor:
-                return await cursor.fetchone()
+            async with db.execute(
+                "SELECT role, status, id_limit FROM users WHERE user_id = ?", 
+                (user_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return {"role": row[0], "status": row[1], "id_limit": row[2]}
+                # Fallback values for unregistered users
+                return {"role": "normal", "status": "active", "id_limit": 5}
 
-    async def execute_read_all(self, query: str, parameters: tuple = ()) -> List[Tuple]:
-        """Fetch a list of matching database entries."""
+    async def register_user(self, user_id: int, role: str = "normal"):
+        """Registers a user with a default role if they do not already exist."""
         async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute(query, parameters) as cursor:
-                return await cursor.fetchall()
-
-    # --- USER ADMINISTRATION QUERIES ---
-    async def get_user_role(self, user_id: int) -> str:
-        if user_id in config.SUPER_OWNER_IDS:
-            return "super_owner"
-        
-        row = await self.execute_read_one("SELECT role, status FROM users WHERE user_id = ?", (user_id,))
-        if row:
-            role, status = row
-            if status == "banned":
-                return "banned"
-            return role
-        return "user"
-
-    async def get_user_account_limit(self, user_id: int) -> int:
-        if user_id in config.SUPER_OWNER_IDS:
-            return 999999
-        row = await self.execute_read_one("SELECT max_accounts FROM users WHERE user_id = ?", (user_id,))
-        return row[0] if row else config.DEFAULT_USER_MAX_ACCOUNTS
-
-    async def create_user_if_not_exists(self, user_id: int, username: str, referred_by: Optional[int] = None) -> bool:
-        row = await self.execute_read_one("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
-        if not row:
-            # Prevent self-referral loop strings
-            if referred_by == user_id:
-                referred_by = None
-            await self.execute_write(
-                "INSERT INTO users (user_id, username, role, referred_by, max_accounts) VALUES (?, ?, 'user', ?, ?)",
-                (user_id, username, referred_by, config.DEFAULT_USER_MAX_ACCOUNTS)
+            await db.execute(
+                "INSERT OR IGNORE INTO users (user_id, role, status, id_limit) VALUES (?, ?, 'active', 5)",
+                (user_id, role)
             )
-            return True
-        return False
+            await db.commit()
 
-    # --- ACCOUNT INFRASTRUCTURE CONTROL ---
-    async def get_active_sessions(self, user_id: int, user_role: str) -> List[Tuple[str, str, str]]:
+    async def update_role(self, user_id: int, role: str, limit: int = 5):
+        """Updates a user's role and limit, or creates them if missing."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO users (user_id, role, id_limit, status) 
+                VALUES (?, ?, ?, 'active') 
+                ON CONFLICT(user_id) DO UPDATE SET 
+                    role = excluded.role, 
+                    id_limit = excluded.id_limit
+            """, (user_id, role, limit))
+            await db.commit()
+
+    async def add_target_id(self, owner_id: int, target_id: str) -> bool:
+        """Adds a target ID under the user's ownership, checking limit restrictions."""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Check user role and limits
+            async with db.execute("SELECT role, id_limit FROM users WHERE user_id = ?", (owner_id,)) as cursor:
+                user = await cursor.fetchone()
+            
+            role = user[0] if user else "normal"
+            limit = user[1] if user else 5
+
+            # Super owners completely bypass the target ID counts/limits
+            if role != "super_owner":
+                async with db.execute("SELECT COUNT(*) FROM target_ids WHERE owner_id = ?", (owner_id,)) as cursor:
+                    count_row = await cursor.fetchone()
+                    count = count_row[0] if count_row else 0
+                    if count >= limit:
+                        return False  # Limit reached! Reject addition
+
+            # Add the target ID safely
+            try:
+                await db.execute(
+                    "INSERT OR IGNORE INTO target_ids (owner_id, target_id) VALUES (?, ?)", 
+                    (owner_id, target_id)
+                )
+                await db.commit()
+                return True
+            except Exception:
+                return False
+
+    async def get_user_targets(self, user_id: int, role: str) -> list:
         """
-        Fetches tuple lists of active accounts.
-        Admins/Owners pull everything. Standard users pull only their registered items.
-        Returns: [(phone, session_string, username)]
+        Retrieves targets. 
+        - Normal and Owners only see target IDs they registered.
+        - Super Owners see all target IDs in the database.
         """
-        if user_role in ["admin", "owner", "super_owner"]:
-            rows = await self.execute_read_all("SELECT phone, session_string, username FROM accounts WHERE status = 'active'")
-        else:
-            rows = await self.execute_read_all("SELECT phone, session_string, username FROM accounts WHERE status = 'active' AND user_id = ?", (user_id,))
-        return rows
-
-    async def register_session(self, phone: str, user_id: int, username: str, enc_session: str) -> None:
-        await self.execute_write(
-            """
-            INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
-            VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
-            """,
-            (phone.replace("+", "").strip(), user_id, username or "None", enc_session)
-        )
-
-    async def update_account_status(self, phone: str, status: str) -> None:
-        await self.execute_write("UPDATE accounts SET status = ?, last_active = CURRENT_TIMESTAMP WHERE phone = ?", (status, phone))
-
-    async def delete_account(self, phone: str) -> bool:
-        clean_phone = phone.replace("+", "").strip()
-        # Verify it exists first
-        row = await self.execute_read_one("SELECT 1 FROM accounts WHERE phone = ?", (clean_phone,))
-        if not row:
-            return False
-        await self.execute_write("DELETE FROM accounts WHERE phone = ?", (clean_phone,))
-        return True
-
-    # --- TASK QUEUE OPERATIONS ---
-    async def create_task(self, creator_id: int, task_type: str, payload_data: dict) -> int:
-        payload_str = json.dumps(payload_data)
-        task_id = await self.execute_write(
-            "INSERT INTO tasks (creator_id, type, payload) VALUES (?, ?, ?)",
-            (creator_id, task_type, payload_str)
-        )
-        return task_id
-
-    async def update_task_progress(self, task_id: int, progress: str) -> None:
-        await self.execute_write("UPDATE tasks SET progress = ? WHERE task_id = ?", (progress, task_id))
-
-    async def complete_task(self, task_id: int, status: str, progress: str, success_list: list, failure_list: list) -> None:
-        success_str = json.dumps(success_list)
-        failure_str = json.dumps(failure_list)
-        await self.execute_write(
-            """
-            UPDATE tasks 
-            SET status = ?, progress = ?, success_report = ?, failure_report = ? 
-            WHERE task_id = ?
-            """,
-            (status, progress, success_str, failure_str, task_id)
-        )
-
-db_mgr = Database()
+        async with aiosqlite.connect(self.db_path) as db:
+            if role == "super_owner":
+                async with db.execute("SELECT target_id FROM target_ids") as cursor:
+                    rows = await cursor.fetchall()
+                    return [row[0] for row in rows]
+            else:
+                async with db.execute("SELECT target_id FROM target_ids WHERE owner_id = ?", (user_id,)) as cursor:
+                    rows = await cursor.fetchall()
+                    return [row[0] for row in rows]
