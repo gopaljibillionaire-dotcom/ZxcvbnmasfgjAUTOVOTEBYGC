@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import shutil
 from typing import Dict, Any, List, Optional, Tuple
 
 # aiogram 3.x imports
@@ -27,23 +28,17 @@ from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
-    PasswordHashInvalidError
+    PasswordHashInvalidError,
+    FloodWaitError
 )
 
 # SQLite
 import aiosqlite
 
-# --- CONFIGURATION ---
-API_ID = int(os.getenv("TG_API_ID", "30636134"))
-API_HASH = os.getenv("TG_API_HASH", "9c5bb2bbeb19a0da5bfb0e7052875d2f")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8733721396:AAHJrr4uHC2WEx5r6BCHqBmx4LbMKh1Ngds")
+# Import Configuration Settings
+import config
 
-# HARDCODED MULTI-SUPER-OWNER MATRIX
-SUPER_OWNER_IDS = [7952327997, 7953147643, 8064493735] 
-
-SECRET_KEY = os.getenv("ENCRYPTION_KEY", "pydroid_secure_fallback_key_2026")
-
-# --- LOGGING ---
+# --- LOGGING SYSTEM ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -51,9 +46,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MultiAccountSystem")
 
+bot = Bot(token=config.BOT_TOKEN)
+
+# --- SYSTEM LOG DISPATCHER ---
+async def dispatch_log(text: str):
+    """Dispatches real-time structural audits to standard out and the log channel."""
+    logger.info(f"[LOG CHANNEL EVENT]: {text}")
+    try:
+        await bot.send_message(chat_id=config.LOG_CHANNEL_ID, text=f"🔔 **System Audit Event**\n\n{text}")
+    except Exception as e:
+        logger.error(f"Failed to transmit event telemetry to Log Channel {config.LOG_CHANNEL_ID}: {e}")
+
 # --- CRYPTO HELPERS ---
 def _get_crypto_key() -> int:
-    return sum(ord(c) for c in SECRET_KEY) % 256 or 42
+    return sum(ord(c) for c in config.SECRET_KEY) % 256 or 42
 
 def encrypt_data(data: str) -> str:
     key = _get_crypto_key()
@@ -80,25 +86,20 @@ def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool]:
     if not link:
         return None, None, False
         
-    # Check for private join hash formats first
-    # Matches: t.me/joinchat/XXXX, t.me/+XXXX, joinchat/XXXX, or just +XXXX
     hash_match = re.search(r'(?:joinchat/|\+|t\.me/\+)([a-zA-Z0-9_\-]+)', link)
     if hash_match:
         return hash_match.group(1), None, True
 
-    # Matches private channel post links: t.me/c/12345678/90
     private_match = re.search(r't\.me/c/(\d+)/(\d+)', link)
     if private_match:
         channel_id = int(f"-100{private_match.group(1)}")
         msg_id = int(private_match.group(2))
         return channel_id, msg_id, False
         
-    # Matches public post links: t.me/username/90
     msg_match = re.search(r't\.me/([^/]+)/(\d+)', link)
     if msg_match:
         return msg_match.group(1), int(msg_match.group(2)), False
         
-    # Matches raw clean username formats
     target = link.replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "")
     if "/" in target:
         parts = target.split("/")
@@ -123,6 +124,7 @@ class Database:
                     role TEXT DEFAULT 'user', 
                     max_accounts INTEGER DEFAULT 5,
                     referred_by INTEGER,
+                    status TEXT DEFAULT 'active',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -165,14 +167,19 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("INSERT INTO logs (user_id, action) VALUES (?, ?)", (user_id, action))
             await db.commit()
+        await dispatch_log(f"👤 **User ID:** `{user_id}`\n🛠️ **Action:** {action}")
 
     async def get_user_role(self, user_id: int) -> str:
-        if user_id in SUPER_OWNER_IDS:
+        if user_id in config.SUPER_OWNER_IDS:
             return "super_owner"
         async with aiosqlite.connect(self.db_path) as db:
-            async with db.execute("SELECT role FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            async with db.execute("SELECT role, status FROM users WHERE user_id = ?", (user_id,)) as cursor:
                 row = await cursor.fetchone()
-                return row[0] if row else "user"
+                if row:
+                    if row[1] == "banned":
+                        return "banned"
+                    return row[0]
+                return "user"
 
     async def get_admin_limits(self, user_id: int) -> int:
         async with aiosqlite.connect(self.db_path) as db:
@@ -189,6 +196,8 @@ class Database:
                         (user_id, username, referred_by)
                     )
                     await db.commit()
+                    if referred_by:
+                        await self.log_action(user_id, f"Registered via referral node link from Owner ID: `{referred_by}`")
 
 db_mgr = Database()
 registration_sessions: Dict[int, Dict[str, Any]] = {}
@@ -218,7 +227,6 @@ class TaskQueue:
 
     async def execute_task(self, task_id: int, creator_id: int, task_type: str, payload: dict):
         import random
-        from telethon.errors import FloodWaitError
 
         async with aiosqlite.connect(db_mgr.db_path) as db:
             await db.execute("UPDATE tasks SET status = 'running', progress = '0%' WHERE task_id = ?", (task_id,))
@@ -248,17 +256,16 @@ class TaskQueue:
         failed_ids: List[Tuple[str, str]] = []
         total_accounts = len(clients_data)
 
-        # --- TELEGRAM SPAM TRAP EVASION CONFIGURATION ---
+        # SPAM EVASION PARAMS
         BATCH_SIZE = 5               
         BASE_COOLDOWN = 15           
 
         for index, (phone, enc_session) in enumerate(clients_data):
-            client = TelegramClient(StringSession(enc_session), API_ID, API_HASH)
+            client = TelegramClient(StringSession(enc_session), config.API_ID, config.API_HASH)
             try:
-                # 1. Human Simulation: Add a small staggered startup delay before connecting
                 await asyncio.sleep(random.uniform(1.0, 3.0))
-                
                 await client.connect()
+                
                 if not await client.is_user_authorized():
                     async with aiosqlite.connect(db_mgr.db_path) as db_conn:
                         await db_conn.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
@@ -270,24 +277,41 @@ class TaskQueue:
                 parsed_target, link_msg_id, is_private_hash = parse_telegram_link(target)
                 msg_id = int(payload.get("msg_id", link_msg_id or 0))
 
-                # 2. Human Simulation: Add a realistic read delay before interacting
                 await asyncio.sleep(random.uniform(2.5, 5.0))
 
                 # --- OPERATION ROUTER ---
                 if task_type == "join":
                     if is_private_hash:
-                        # Clean call using exact invite hash
                         await client(functions.messages.ImportChatInviteRequest(hash=parsed_target))
                     else:
                         await client(functions.channels.JoinChannelRequest(channel=parsed_target))
                         
                 elif task_type == "leave":
-                    # Leave can work on both public username and private parsed target ID
                     await client(functions.channels.LeaveChannelRequest(channel=parsed_target))
                     
                 elif task_type == "react":
+                    react_mode = payload.get("react_mode", "standard")
                     emojis = payload.get("reactions", ["👍"])
-                    assigned_emoji = emojis[index % len(emojis)]
+                    
+                    if react_mode == "random":
+                        assigned_emoji = random.choice(config.REACTION_EMOJIS)
+                    elif react_mode == "existing_reactions":
+                        # Fetch the message, scan existing reactions, and match them
+                        msg = await client.get_messages(parsed_target, ids=msg_id)
+                        if msg and msg.reactions and msg.reactions.results:
+                            active_reactions = [
+                                r.reaction.emoticon for r in msg.reactions.results 
+                                if hasattr(r.reaction, 'emoticon')
+                            ]
+                            if active_reactions:
+                                assigned_emoji = random.choice(active_reactions)
+                            else:
+                                assigned_emoji = random.choice(emojis) # Fallback to setup defaults
+                        else:
+                            assigned_emoji = random.choice(emojis)
+                    else:
+                        assigned_emoji = emojis[index % len(emojis)]
+
                     await client(functions.messages.SendReactionRequest(
                         peer=parsed_target,
                         msg_id=msg_id,
@@ -328,8 +352,7 @@ class TaskQueue:
                 wait_time = fwe.seconds
                 logger.warning(f"⚠️ Account +{phone} hit a FloodWait! Action requires {wait_time}s cooldown.")
                 failed_ids.append((phone, f"FloodWaitError: Blocked for {wait_time}s"))
-                backoff = min(wait_time, 30)
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(min(wait_time, 30))
                 
             except Exception as e:
                 logger.warning(f"Bridge +{phone} skipped task #{task_id}: {e}")
@@ -337,14 +360,11 @@ class TaskQueue:
             finally:
                 await client.disconnect()
 
-            # --- DYNAMIC BATCH AND STEP COOLDOWNS ---
+            # Dynamic cooldowns between tasks
             if (index + 1) % BATCH_SIZE == 0 and (index + 1) < total_accounts:
-                batch_cooldown = BASE_COOLDOWN + random.randint(5, 15)
-                logger.info(f"⚡ Batch threshold met ({index + 1}/{total_accounts}). Halting execution for {batch_cooldown} seconds...")
-                await asyncio.sleep(batch_cooldown)
+                await asyncio.sleep(BASE_COOLDOWN + random.randint(5, 15))
             else:
-                micro_delay = random.uniform(3.0, 6.5)
-                await asyncio.sleep(micro_delay)
+                await asyncio.sleep(random.uniform(3.0, 6.5))
 
             progress_pct = f"{int(((index + 1) / total_accounts) * 100)}%"
             async with aiosqlite.connect(db_mgr.db_path) as db:
@@ -362,6 +382,12 @@ class TaskQueue:
             )
             await db.commit()
 
+        await dispatch_log(
+            f"📋 **Task #{task_id} Completed**\n"
+            f"⚙️ **Type:** `{task_type.upper()}`\n"
+            f"🟢 **Success:** `{len(passed_ids)}` | 🔴 **Failed:** `{len(failed_ids)}`"
+        )
+
 task_queue = TaskQueue()
 
 # --- FSM STATES ---
@@ -373,6 +399,7 @@ class RegistrationStates(StatesGroup):
 class TaskWizardStates(StatesGroup):
     choosing_type = State()
     waiting_for_target = State()
+    choosing_react_mode = State()
     waiting_for_emojis = State()
     waiting_for_button_text = State()
     waiting_for_dm_text = State()
@@ -393,7 +420,7 @@ def get_emoji_selection_keyboard(selected_emojis: List[str]) -> InlineKeyboardMa
     if row:
         keyboard.append(row)
     
-    keyboard.append([InlineKeyboardButton(text="✅ Done Select Emojis", callback_data="finish_emoji_selection")])
+    keyboard.append([InlineKeyboardButton(text="✅ Complete Selection", callback_data="finish_emoji_selection")])
     keyboard.append([InlineKeyboardButton(text="🔙 Back to Main Console", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -430,6 +457,12 @@ async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
     username = message.from_user.username or "Unknown"
     
+    # Check if the user is banned first
+    role = await db_mgr.get_user_role(user_id)
+    if role == "banned":
+        await message.answer("🚫 You have been banned from using this system.")
+        return
+
     referred_by = None
     if len(message.text.split()) > 1:
         ref_payload = message.text.split()[1]
@@ -439,6 +472,7 @@ async def cmd_start(message: Message, state: FSMContext):
                 referred_by = None
 
     await db_mgr.create_user_if_not_exists(user_id, username, referred_by)
+    # Re-fetch role in case user is new
     role = await db_mgr.get_user_role(user_id)
 
     welcome_text = (
@@ -453,12 +487,80 @@ async def cmd_start(message: Message, state: FSMContext):
 async def handle_main_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     role = await db_mgr.get_user_role(callback.from_user.id)
+    if role == "banned":
+        await callback.answer("🚫 You are banned.", show_alert=True)
+        return
     await callback.message.edit_text(
         "👋 **Main Control Console**\nSelect an action vector below:",
         reply_markup=get_main_keyboard(role)
     )
 
-# --- ADMINISTRATIVE ROLES ASSIGNMENT SYSTEM ---
+# --- TELETHON .SESSION FILE FORWARDING IMPORTER ---
+@router.message(F.document)
+async def handle_session_file_import(message: Message):
+    user_id = message.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    
+    if role == "banned":
+        return
+
+    # Check if document ends with .session
+    if not message.document.file_name.endswith(".session"):
+        return
+
+    # Restrict session imports to authorized administrative roles
+    if role not in ["admin", "owner", "super_owner"]:
+        await message.answer("🚫 Only Administrators can import raw session files.")
+        return
+
+    status_msg = await message.answer("📥 **Downloading and verifying session context structure...**")
+    
+    file_info = await bot.get_file(message.document.file_id)
+    session_file_path = f"temp_{message.document.file_name}"
+    await bot.download_file(file_info.file_path, session_file_path)
+
+    try:
+        # Read raw content of the session file
+        with open(session_file_path, "r", encoding="utf-8", errors="ignore") as f:
+            session_data = f.read().strip()
+
+        # Generate a StringSession from the file content
+        session_str = StringSession(session_data).save() if len(session_data) > 60 else session_data
+        
+        # Test connection structure
+        client = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            await status_msg.edit_text("❌ Verification failed: The session file is invalid or expired.")
+            await client.disconnect()
+            if os.path.exists(session_file_path):
+                os.remove(session_file_path)
+            return
+
+        me = await client.get_me()
+        phone = me.phone
+        encrypted_session = encrypt_data(session_str)
+
+        async with aiosqlite.connect(db_mgr.db_path) as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
+                VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
+            """, (phone, user_id, me.username or "None", encrypted_session))
+            await db.commit()
+
+        await client.disconnect()
+        await db_mgr.log_action(user_id, f"Imported manual Telethon session file for +{phone}")
+        await status_msg.edit_text(f"✅ **Import Successful!**\n📱 Phone: `+{phone}`\n👤 Username: @{me.username or 'None'} has been linked to the cluster.")
+
+    except Exception as e:
+        logger.error(f"Error importing forwarded session file: {e}")
+        await status_msg.edit_text(f"❌ **Failed to import session:** {str(e)}")
+    finally:
+        if os.path.exists(session_file_path):
+            os.remove(session_file_path)
+
+# --- EXPANDED ADMINISTRATIVE CONTROL SUITE ---
 @router.message(Command("addadmin"))
 async def cmd_add_admin(message: Message):
     role = await db_mgr.get_user_role(message.from_user.id)
@@ -508,6 +610,131 @@ async def cmd_remove_admin(message: Message):
     await db_mgr.log_action(message.from_user.id, f"Demoted Admin {target_id}")
     await message.answer(f"✅ User ID `{target_id}` has been stripped of Admin access privileges.")
 
+@router.message(Command("banuser"))
+async def cmd_ban_user(message: Message):
+    role = await db_mgr.get_user_role(message.from_user.id)
+    if role not in ["admin", "owner", "super_owner"]:
+        await message.answer("🚫 Access Denied.")
+        return
+
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("ℹ️ **Usage:** `/banuser <target_user_id>`")
+        return
+
+    target_id = int(args[1])
+    target_role = await db_mgr.get_user_role(target_id)
+    if target_role in ["owner", "super_owner"]:
+        await message.answer("❌ System Error: You cannot ban administrative owners.")
+        return
+
+    async with aiosqlite.connect(db_mgr.db_path) as db:
+        await db.execute("UPDATE users SET status = 'banned' WHERE user_id = ?", (target_id,))
+        await db.commit()
+
+    await db_mgr.log_action(message.from_user.id, f"Banned user ID {target_id}")
+    await message.answer(f"✅ User ID `{target_id}` has been successfully banned from using the system.")
+
+@router.message(Command("unbanuser"))
+async def cmd_unban_user(message: Message):
+    role = await db_mgr.get_user_role(message.from_user.id)
+    if role not in ["admin", "owner", "super_owner"]:
+        await message.answer("🚫 Access Denied.")
+        return
+
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("ℹ️ **Usage:** `/unbanuser <target_user_id>`")
+        return
+
+    target_id = int(args[1])
+    async with aiosqlite.connect(db_mgr.db_path) as db:
+        await db.execute("UPDATE users SET status = 'active' WHERE user_id = ?", (target_id,))
+        await db.commit()
+
+    await db_mgr.log_action(message.from_user.id, f"Unbanned user ID {target_id}")
+    await message.answer(f"✅ User ID `{target_id}` status set back to active.")
+
+@router.message(Command("deletenumber"))
+async def cmd_delete_number(message: Message):
+    role = await db_mgr.get_user_role(message.from_user.id)
+    if role not in ["admin", "owner", "super_owner"]:
+        await message.answer("🚫 Access Denied.")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("ℹ️ **Usage:** `/deletenumber <phone_number_without_plus>`\nExample: `/deletenumber 1234567890`")
+        return
+
+    phone = args[1].replace("+", "").strip()
+    async with aiosqlite.connect(db_mgr.db_path) as db:
+        async with db.execute("SELECT 1 FROM accounts WHERE phone = ?", (phone,)) as cursor:
+            if not await cursor.fetchone():
+                await message.answer("❌ This phone number does not exist inside our active nodes.")
+                return
+        await db.execute("DELETE FROM accounts WHERE phone = ?", (phone,))
+        await db.commit()
+
+    await db_mgr.log_action(message.from_user.id, f"Deleted account node +{phone} from system.")
+    await message.answer(f"✅ Bridge node account `+{phone}` has been successfully unlinked and wiped.")
+
+@router.message(Command("deleteuser"))
+async def cmd_delete_user(message: Message):
+    role = await db_mgr.get_user_role(message.from_user.id)
+    if role not in ["owner", "super_owner"]:
+        await message.answer("🚫 Access Denied.")
+        return
+
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("ℹ️ **Usage:** `/deleteuser <user_id>`")
+        return
+
+    target_id = int(args[1])
+    target_role = await db_mgr.get_user_role(target_id)
+    if target_role == "super_owner":
+        await message.answer("❌ Exception: Cannot delete Super Owners.")
+        return
+
+    async with aiosqlite.connect(db_mgr.db_path) as db:
+        # Wipe tasks and accounts associated with this profile
+        await db.execute("DELETE FROM accounts WHERE user_id = ?", (target_id,))
+        await db.execute("DELETE FROM tasks WHERE creator_id = ?", (target_id,))
+        await db.execute("DELETE FROM users WHERE user_id = ?", (target_id,))
+        await db.commit()
+
+    await db_mgr.log_action(message.from_user.id, f"Wiped database footprint of user ID {target_id}")
+    await message.answer(f"✅ User ID `{target_id}` and all associated nodes/operations have been deleted.")
+
+@router.message(Command("export_session"))
+async def cmd_export_session(message: Message):
+    role = await db_mgr.get_user_role(message.from_user.id)
+    if role not in ["admin", "owner", "super_owner"]:
+        await message.answer("🚫 Access Denied.")
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("ℹ️ **Usage:** `/export_session <phone_number_without_plus>`")
+        return
+
+    phone = args[1].replace("+", "").strip()
+    async with aiosqlite.connect(db_mgr.db_path) as db:
+        async with db.execute("SELECT session_string FROM accounts WHERE phone = ?", (phone,)) as cursor:
+            row = await cursor.fetchone()
+            
+    if not row:
+        await message.answer("❌ No record of this active connection found.")
+        return
+
+    session_str = decrypt_data(row[0])
+    # Pack session directly to dispatch
+    file_data = session_str.encode('utf-8')
+    file_payload = BufferedInputFile(file_data, filename=f"+{phone}.session")
+    
+    await message.reply_document(file_payload, caption=f"🔑 Session extraction file for `+{phone}`.")
+
 # --- ACCOUNT INFRASTRUCTURE DEPLOYMENT ---
 @router.callback_query(F.data == "manage_accounts")
 async def list_user_accounts(callback: CallbackQuery):
@@ -545,7 +772,7 @@ async def process_phone(message: Message, state: FSMContext):
     phone = message.text.strip().replace(" ", "").replace("-", "")
     user_id = message.from_user.id
 
-    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    client = TelegramClient(StringSession(), config.API_ID, config.API_HASH)
     await client.connect()
     try:
         sent_code = await client.send_code_request(phone)
@@ -639,14 +866,12 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
             f"🆔 **Linked By User ID:** `{user_id}`"
         )
         
-        # 1. Dispatch back to the local user who linked it
         try:
             await message.answer_document(document=session_file, caption=caption_text)
         except Exception as e:
             logger.error(f"Failed sending session file copy to linking user: {e}")
             
-        # 2. Loop and dispatch backup copy to all registered Super Owners
-        for owner_id in SUPER_OWNER_IDS:
+        for owner_id in config.SUPER_OWNER_IDS:
             try:
                 owner_file = BufferedInputFile(session_bytes, filename=f"+{clean_phone}.session")
                 await message.bot.send_document(chat_id=owner_id, document=owner_file, caption=caption_text)
@@ -697,13 +922,14 @@ async def task_hub_process_target(message: Message, state: FSMContext):
         await finalize_task_creation(message, state)
         
     elif task_type == "react":
-        await state.update_data(selected_emojis=[])
-        await message.answer(
-            "🎭 **Choose Emojis to Distribute:**\nSelect one or more reaction emojis from the buttons below. "
-            "The active accounts will distribute these reactions evenly.",
-            reply_markup=get_emoji_selection_keyboard([])
-        )
-        await state.set_state(TaskWizardStates.waiting_for_emojis)
+        # Reaction Mode Selector Option
+        buttons = [
+            [InlineKeyboardButton(text="🎭 Choose Specific Emojis", callback_data="react_mode:standard")],
+            [InlineKeyboardButton(text="⚡ Sync Existing Reactions On Post", callback_data="react_mode:existing_reactions")],
+            [InlineKeyboardButton(text="🎲 Distribute Random Reactions", callback_data="react_mode:random")]
+        ]
+        await message.answer("⚙️ **Select Reaction Strategy Mode:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        await state.set_state(TaskWizardStates.choosing_react_mode)
         
     elif task_type == "button_vote":
         await message.answer(
@@ -714,6 +940,24 @@ async def task_hub_process_target(message: Message, state: FSMContext):
     elif task_type == "dm":
         await message.answer("📝 **Message Body Content:** Enter the text string to dispatch to the target:")
         await state.set_state(TaskWizardStates.waiting_for_dm_text)
+
+@router.callback_query(StateFilter(TaskWizardStates.choosing_react_mode), F.data.startswith("react_mode:"))
+async def process_react_mode(callback: CallbackQuery, state: FSMContext):
+    mode = callback.data.split(":")[1]
+    await state.update_data(react_mode=mode)
+    
+    if mode == "standard":
+        await state.update_data(selected_emojis=[])
+        await callback.message.edit_text(
+            "🎭 **Choose Emojis to Distribute:**\nSelect one or more reaction emojis from the buttons below. "
+            "The active accounts will distribute these reactions evenly.",
+            reply_markup=get_emoji_selection_keyboard([])
+        )
+        await state.set_state(TaskWizardStates.waiting_for_emojis)
+    else:
+        # For 'existing_reactions' or 'random', we can finalize directly
+        await callback.message.delete()
+        await finalize_task_creation(callback.message, state)
 
 # --- REACTION MULTI-SELECTOR CONTROLLERS ---
 @router.callback_query(StateFilter(TaskWizardStates.waiting_for_emojis), F.data.startswith("toggle_emoji:"))
@@ -930,10 +1174,15 @@ async def handle_admin_panel(callback: CallbackQuery):
         await callback.answer("🚫 Access Denied.", show_alert=True)
         return
     await callback.message.edit_text(
-        "🛠️ **Administrative Infrastructure Management Console**\n"
-        "Use text command allocations for core configurations:\n\n"
-        "🔹 `/addadmin <id> <limit>`\n"
-        "🔹 `/removeadmin <id>`",
+        "🛠️ **Administrative Control Console**\n\n"
+        "**Available Command Syntax:**\n"
+        "• `/addadmin <id> <limit>`\n"
+        "• `/removeadmin <id>`\n"
+        "• `/banuser <id>`\n"
+        "• `/unbanuser <id>`\n"
+        "• `/deletenumber <phone>`\n"
+        "• `/deleteuser <id>`\n"
+        "• `/export_session <phone>`",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]])
     )
 
@@ -998,7 +1247,7 @@ async def verify_saved_sessions():
 
     for phone, enc_session in accounts:
         try:
-            client = TelegramClient(StringSession(decrypt_data(enc_session)), API_ID, API_HASH)
+            client = TelegramClient(StringSession(decrypt_data(enc_session)), config.API_ID, config.API_HASH)
             await client.connect()
             if not await client.is_user_authorized():
                 logger.warning(f"Bridge connection verification dropped for +{phone}. Flagging dead.")
@@ -1013,12 +1262,14 @@ async def main():
     await db_mgr.init()
     await verify_saved_sessions()
 
-    bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
     worker_task = asyncio.create_task(task_queue.start_worker())
-    logger.info("Application successfully attached to active network long polling loops.")
+    
+    # Notify logging channel on startup
+    await dispatch_log("🚀 **System Core Started Successfully.** All networks online.")
+
     try:
         await dp.start_polling(bot)
     finally:
