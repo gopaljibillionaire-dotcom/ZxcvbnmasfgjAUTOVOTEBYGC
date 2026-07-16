@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import sys
+import json
 from typing import Dict, Any, List, Optional
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -31,7 +32,7 @@ from telethon.errors import (
 import config
 from database import db_mgr
 from helpers import encrypt_data, decrypt_data, parse_telegram_link, dispatch_log
-from tasks import TaskQueue
+from tasks import task_engine
 
 # --- SETUP ROOT LOGGING CORE ---
 logging.basicConfig(
@@ -44,9 +45,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SystemCore")
 
-# Initialize central Bot interface
 bot = Bot(token=config.BOT_TOKEN)
-task_engine: Optional[TaskQueue] = None
 
 # RAM holding pool for step-by-step OTP logins
 registration_sessions: Dict[int, Dict[str, Any]] = {}
@@ -84,20 +83,28 @@ def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
 async def make_accounts_keyboard(user_id: int, role: str) -> InlineKeyboardMarkup:
     keyboard_layout = []
     
-    # Load all accounts linked with the requester's ID
-    rows = await db_mgr.get_active_sessions(user_id, role)
+    # Super-owners extract complete global topology, others pull matching contextual records
+    if role == "super_owner":
+        rows = await db_mgr.execute_read_all("SELECT phone, user_id, username FROM accounts WHERE status = 'active'")
+    else:
+        rows = await db_mgr.get_active_sessions(user_id, role)
 
-    for phone, _, username in rows:
+    for row in rows:
+        phone = row[0]
+        owner_id = row[1]
+        username = row[2]
         name_display = f"@{username}" if username and username != "None" else "No Username"
+        ownership_ctx = f" (Owner: {owner_id})" if role == "super_owner" else ""
+        
         keyboard_layout.append([
-            InlineKeyboardButton(text=f"🟢 +{phone} ({name_display})", callback_data=f"info_node:{phone}")
+            InlineKeyboardButton(text=f"🟢 +{phone} {name_display}{ownership_ctx}", callback_data=f"info_node:{phone}")
         ])
-        # Direct download button for each linked session
         keyboard_layout.append([
             InlineKeyboardButton(text=f"📥 Export +{phone} .session file", callback_data=f"direct_export:{phone}")
         ])
 
     keyboard_layout.append([InlineKeyboardButton(text="➕ Link via OTP (Phone)", callback_data="add_account_phone")])
+    # Open session uploads to all validated actors per business rules requirement
     keyboard_layout.append([InlineKeyboardButton(text="📥 Link via Session File", callback_data="add_account_session_file")])
     keyboard_layout.append([InlineKeyboardButton(text="🔙 Back to Main Console", callback_data="main_menu")])
     
@@ -117,7 +124,6 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("🚫 You have been banned from using this system.")
         return
 
-    # Process referral links if payload exists
     referred_by = None
     args = message.text.split()
     if len(args) > 1:
@@ -125,7 +131,6 @@ async def cmd_start(message: Message, state: FSMContext):
         if ref_payload.startswith("ref_") and ref_payload[4:].isdigit():
             referred_by = int(ref_payload[4:])
 
-    # Track entry logs
     is_new = await db_mgr.create_user_if_not_exists(user_id, username, referred_by)
     if is_new:
         await db_mgr.execute_write("INSERT INTO logs (user_id, action) VALUES (?, ?)", (user_id, "User Registered"))
@@ -179,8 +184,9 @@ async def handle_direct_export(callback: CallbackQuery):
 
     phone = callback.data.split(":")[1]
     
-    # Restrict users from accessing accounts belonging to other people
-    if role in ["admin", "owner", "super_owner"]:
+    if role == "super_owner":
+        row = await db_mgr.execute_read_one("SELECT session_string FROM accounts WHERE phone = ?", (phone,))
+    elif role in ["admin", "owner"]:
         row = await db_mgr.execute_read_one("SELECT session_string FROM accounts WHERE phone = ?", (phone,))
     else:
         row = await db_mgr.execute_read_one("SELECT session_string FROM accounts WHERE phone = ? AND user_id = ?", (phone, user_id))
@@ -206,13 +212,6 @@ async def handle_node_info_alert(callback: CallbackQuery):
 # --- INTERACTIVE WIZARD: LINK VIA SESSION FILE ---
 @router.callback_query(F.data == "add_account_session_file")
 async def start_session_file_wizard(callback: CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    
-    if role not in ["admin", "owner", "super_owner"]:
-        await callback.answer("🚫 Unauthorized: Only administrators can import raw sessions.", show_alert=True)
-        return
-
     await callback.message.edit_text(
         "📥 **Session File Importer Wizard**\n\n"
         "Send or forward a valid Telethon `.session` document to this chat. "
@@ -240,7 +239,6 @@ async def process_session_file_input(message: Message, state: FSMContext):
         with open(temp_path, "r", encoding="utf-8", errors="ignore") as f:
             session_data = f.read().strip()
 
-        # Extract session keys
         session_str = StringSession(session_data).save() if len(session_data) > 60 else session_data
         
         client = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
@@ -282,7 +280,7 @@ async def handle_loose_forwarded_session(message: Message):
     user_id = message.from_user.id
     role = await db_mgr.get_user_role(user_id)
     
-    if role not in ["admin", "owner", "super_owner"] or not message.document.file_name.endswith(".session"):
+    if not message.document.file_name.endswith(".session"):
         return
 
     status_msg = await message.answer("📥 **Loose Session File Detected: Validating session...**")
@@ -408,7 +406,6 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
 
         await message.answer(f"🎉 Channel Verified! Account `+{phone}` (@{me.username or 'N/A'}) is active in the cluster.")
         
-        # Dispatch backup files to linking users and administrators
         clean_phone = phone.replace("+", "").strip()
         session_bytes = session_str.encode('utf-8')
         session_file = BufferedInputFile(session_bytes, filename=f"+{clean_phone}.session")
@@ -439,7 +436,7 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
         registration_sessions.pop(user_id, None)
         await state.clear()
 
-# --- ADMIN CMDS ---
+# --- ADMINISTRATIVE CMDS ---
 @router.message(Command("addadmin"))
 async def cmd_add_admin(message: Message):
     role = await db_mgr.get_user_role(message.from_user.id)
@@ -454,7 +451,6 @@ async def cmd_add_admin(message: Message):
 
     target_id, limit = int(args[1]), int(args[2])
     
-    # Check if user exists first
     row = await db_mgr.execute_read_one("SELECT 1 FROM users WHERE user_id = ?", (target_id,))
     if not row:
         await db_mgr.execute_write(
@@ -757,17 +753,20 @@ async def view_tasks(callback: CallbackQuery):
     user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
     
-    if role in ["admin", "owner", "super_owner"]:
-        rows = await db_mgr.execute_read_all("SELECT task_id, type, status, progress FROM tasks ORDER BY task_id DESC LIMIT 10")
+    if role == "super_owner":
+        rows = await db_mgr.execute_read_all("SELECT task_id, type, status, progress, creator_id FROM tasks ORDER BY task_id DESC LIMIT 15")
+    elif role in ["admin", "owner"]:
+        rows = await db_mgr.execute_read_all("SELECT task_id, type, status, progress, creator_id FROM tasks ORDER BY task_id DESC LIMIT 15")
     else:
-        rows = await db_mgr.execute_read_all("SELECT task_id, type, status, progress FROM tasks WHERE creator_id = ? ORDER BY task_id DESC LIMIT 10", (user_id,))
+        rows = await db_mgr.execute_read_all("SELECT task_id, type, status, progress, creator_id FROM tasks WHERE creator_id = ? ORDER BY task_id DESC LIMIT 10", (user_id,))
 
-    text = "📊 **Recent Operations Pipeline Log**\n\n"
+    text = "📊 **Operations Pipeline Log Engine**\n\n"
     if not rows:
         text += "_Queue completely empty._"
     else:
         for row in rows:
-            text += f"🔹 **Task #{row[0]}** ({row[1].upper()})\nStatus: `{row[2]}` | Metrics: `{row[3]}`\n↳ /taskreport_{row[0]}\n\n"
+            owner_ctx = f" | User: `{row[4]}`" if role == "super_owner" else ""
+            text += f"🔹 **Task #{row[0]}** ({row[1].upper()}){owner_ctx}\nStatus: `{row[2]}` | Metrics: `{row[3]}`\n↳ /taskreport_{row[0]}\n\n"
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]]))
 
 @router.message(F.text.startswith("/taskreport_"))
@@ -784,26 +783,74 @@ async def cmd_task_report(message: Message):
         (task_id,)
     )
     if not row:
+        await message.answer("❌ Task manifest index not found inside storage.")
         return
 
     creator_id, task_type, status, progress, success_rep, failure_rep = row
-    if role not in ["admin", "owner", "super_owner"] and creator_id != user_id:
+    if role != "super_owner" and creator_id != user_id:
+        await message.answer("🚫 Unauthorized profile request.")
         return
 
-    import json
     passed_list = json.loads(success_rep) if success_rep else []
     failed_list = json.loads(failure_rep) if failure_rep else []
+
+    # Identify historical chain index paths for comparative metrics (Task N vs Task N-1)
+    prev_row = await db_mgr.execute_read_one("SELECT task_id FROM tasks WHERE task_id < ? ORDER BY task_id DESC LIMIT 1", (task_id,))
+    prev_id_str = f"#{prev_row[0]}" if prev_row else "None"
 
     report_text = (
         f"📊 **Manifest Diagnostics Report for Task #{task_id}**\n\n"
         f"⚙️ **Type:** `{task_type.upper()}`\n"
-        f"🚦 **State:** `{status}`\n"
-        f"📈 **Progress:** `{progress}`\n\n"
-        f"🟢 **Success Count:** `{len(passed_list)}` accounts\n"
-        f"🔴 **Failure Count:** `{len(failed_list)}` accounts"
+        f"🚦 **Current State:** `{status.upper()}`\n"
+        f"⏮️ **Preceding Task Pointer:** `{prev_id_str}`\n"
+        f"📈 **Progress Metric:** `{progress}`\n\n"
+        f"🟢 **Success Count:** `{len(passed_list)}` worker nodes\n"
+        f"🔴 **Failure Count:** `{len(failed_list)}` worker nodes"
     )
-    buttons = [[InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu")]]
+    
+    buttons = []
+    if status in ["pending", "running", "queued"]:
+        buttons.append([InlineKeyboardButton(text="🛑 Force Terminate Pipeline", callback_data=f"abort_task:{task_id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu")])
+    
     await message.answer(report_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@router.callback_query(F.data.startswith("abort_task:"))
+async def handle_abort_task(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    task_id = int(callback.data.split(":")[1])
+    
+    row = await db_mgr.execute_read_one("SELECT creator_id, status FROM tasks WHERE task_id = ?", (task_id,))
+    if not row:
+        await callback.answer("Task not found.", show_alert=True)
+        return
+        
+    creator_id, current_status = row
+    if role != "super_owner" and creator_id != user_id:
+        await callback.answer("🚫 Unauthorized access profile.", show_alert=True)
+        return
+        
+    if current_status in ["completed", "failed", "cancelled"]:
+        await callback.answer("⚠️ Task pipeline has already concluded.", show_alert=True)
+        return
+
+    await db_mgr.execute_write("UPDATE tasks SET status = 'cancelled' WHERE task_id = ?", (task_id,))
+    await task_engine.cancel_task_memory(task_id)
+    
+    await callback.message.edit_text(
+        f"🛑 **Termination Signal Distributed!**\nTask pipeline `#{task_id}` has been marked as **CANCELLED**.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[[InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu")]]])
+    )
+    
+    # Send comprehensive details to the logging channel
+    await dispatch_log(
+        bot, 
+        f"🛑 **Manual Abort Intercept Executed:**\n"
+        f"▪️ **Task Context:** `#{task_id}`\n"
+        f"▪️ **Intercepted By User:** `{user_id}`\n"
+        f"▪️ **State Interrupted:** `{current_status}`"
+    )
 
 @router.callback_query(F.data == "view_referrals")
 async def view_referrals(callback: CallbackQuery):
@@ -860,7 +907,6 @@ async def system_stats(callback: CallbackQuery):
 
 # --- STARTUP HANDSHAKE CHANNELS ---
 async def verify_saved_sessions():
-    """Loops through SQLite and flags expired/dead session tokens."""
     logger.info("Performing MTProto authentication checks on all linked bridge sessions...")
     rows = await db_mgr.execute_read_all("SELECT phone, session_string FROM accounts WHERE status = 'active'")
     for phone, enc_session in rows:
@@ -876,19 +922,14 @@ async def verify_saved_sessions():
             logger.error(f"Error checking verification status of +{phone}: {e}")
 
 async def main():
-    global task_engine
     await db_mgr.init()
     await verify_saved_sessions()
-
-    # Instantiate the asynchronous background consumer
-    task_engine = TaskQueue(bot)
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
     worker_task = asyncio.create_task(task_engine.start_worker())
     
-    # Send start log to private log channel
     await dispatch_log(bot, "🚀 **Multi-Account Automation System Core Online.** Operational loops active.")
 
     try:
