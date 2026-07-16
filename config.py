@@ -7,7 +7,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8733721396:AAHJrr4uHC2WEx5r6BCHqBmx4LbMKh1Ng
 
 # --- LOGGING INFRASTRUCTURE ---
 # Set this to your designated GC Log Channel ID (e.g. -100xxxxxxxxxx)
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1002234567890"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1004349607766"))
 
 # --- ADMIN MATRIX ---
 # Super Owners bypass database restriction scopes and retain full system clearance
