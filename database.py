@@ -75,7 +75,7 @@ class Database:
             
         logger.info("Database schemas confirmed and loaded successfully.")
 
-    async def _handle_operational_error(self, error: aiosqlite.sqlite3.OperationalError) -> bool:
+    async def _handle_operational_error(self, error: sqlite3.OperationalError) -> bool:
         """Internal helper to automatically fix missing columns without crashing."""
         error_msg = str(error)
         if "no such column: status" in error_msg:
@@ -85,12 +85,12 @@ class Database:
                     # Attempt altering both tables safely just in case
                     try:
                         await db.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'")
-                    except aiosqlite.sqlite3.OperationalError:
+                    except sqlite3.OperationalError:
                         pass # Column might already be there in this specific table
                     
                     try:
                         await db.execute("ALTER TABLE accounts ADD COLUMN status TEXT DEFAULT 'active'")
-                    except aiosqlite.sqlite3.OperationalError:
+                    except sqlite3.OperationalError:
                         pass
                         
                     await db.commit()
@@ -108,7 +108,7 @@ class Database:
                     last_row_id = cursor.lastrowid
                     await db.commit()
                     return last_row_id
-        except aiosqlite.sqlite3.OperationalError as e:
+        except sqlite3.OperationalError as e:
             if await self._handle_operational_error(e):
                 # Retry transaction once layout modifications settle
                 async with aiosqlite.connect(self.db_path) as db:
@@ -124,7 +124,7 @@ class Database:
             async with aiosqlite.connect(self.db_path) as db:
                 async with db.execute(query, parameters) as cursor:
                     return await cursor.fetchone()
-        except aiosqlite.sqlite3.OperationalError as e:
+        except sqlite3.OperationalError as e:
             if await self._handle_operational_error(e):
                 # Retry query execution following structural fix
                 async with aiosqlite.connect(self.db_path) as db:
@@ -138,7 +138,7 @@ class Database:
             async with aiosqlite.connect(self.db_path) as db:
                 async with db.execute(query, parameters) as cursor:
                     return await cursor.fetchall()
-        except aiosqlite.sqlite3.OperationalError as e:
+        except sqlite3.OperationalError as e:
             if await self._handle_operational_error(e):
                 # Retry query execution following structural fix
                 async with aiosqlite.connect(self.db_path) as db:
