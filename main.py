@@ -83,10 +83,12 @@ def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
 async def make_accounts_keyboard(user_id: int, role: str) -> InlineKeyboardMarkup:
     keyboard_layout = []
     
+    # Isolate data footprint based on credential level
     if role == "super_owner":
         rows = await db_mgr.execute_read_all("SELECT phone, user_id, username FROM accounts WHERE status = 'active'")
     else:
-        rows = await db_mgr.get_active_sessions(user_id, role)
+        # Standard users only see nodes explicitly registered under their Telegram user_id
+        rows = await db_mgr.execute_read_all("SELECT phone, user_id, username FROM accounts WHERE user_id = ? AND status = 'active'", (user_id,))
 
     for row in rows:
         phone = row[0]
@@ -131,10 +133,13 @@ async def cmd_start(message: Message, state: FSMContext):
 
     is_new = await db_mgr.create_user_if_not_exists(user_id, username, referred_by)
     if is_new:
+        # Default fallback role assignment inside DB for fresh users
+        await db_mgr.execute_write("UPDATE users SET role = 'user' WHERE user_id = ? AND role IS NULL", (user_id,))
         await db_mgr.execute_write("INSERT INTO logs (user_id, action) VALUES (?, ?)", (user_id, "User Registered"))
         await dispatch_log(bot, f"👤 **New registration:** `{username}` (`{user_id}`) [Ref: `{referred_by}`]")
 
-    role = await db_mgr.get_user_role(user_id)
+    # Re-fetch operational privileges post registration hook
+    role = await db_mgr.get_user_role(user_id) or "user"
     welcome_text = (
         f"👋 Welcome to the **Enterprise Multi-Account Automation Framework**!\n\n"
         f"👤 **Account ID:** `{user_id}`\n"
@@ -146,7 +151,7 @@ async def cmd_start(message: Message, state: FSMContext):
 @router.callback_query(F.data == "main_menu")
 async def handle_main_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    role = await db_mgr.get_user_role(callback.from_user.id)
+    role = await db_mgr.get_user_role(callback.from_user.id) or "user"
     if role == "banned":
         await callback.answer("🚫 Access denied.", show_alert=True)
         return
@@ -159,7 +164,7 @@ async def handle_main_menu(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "manage_accounts")
 async def list_user_accounts(callback: CallbackQuery):
     user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
+    role = await db_mgr.get_user_role(user_id) or "user"
     
     if role == "banned":
         await callback.answer("🚫 Banned.", show_alert=True)
@@ -174,7 +179,7 @@ async def list_user_accounts(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("direct_export:"))
 async def handle_direct_export(callback: CallbackQuery):
     user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
+    role = await db_mgr.get_user_role(user_id) or "user"
     
     if role == "banned":
         await callback.answer("🚫 Access Denied.", show_alert=True)
@@ -182,11 +187,10 @@ async def handle_direct_export(callback: CallbackQuery):
 
     phone = callback.data.split(":")[1]
     
-    if role == "super_owner":
-        row = await db_mgr.execute_read_one("SELECT session_string FROM accounts WHERE phone = ?", (phone,))
-    elif role in ["admin", "owner"]:
+    if role in ["super_owner", "admin", "owner"]:
         row = await db_mgr.execute_read_one("SELECT session_string FROM accounts WHERE phone = ?", (phone,))
     else:
+        # Rigid authorization boundary checklist context
         row = await db_mgr.execute_read_one("SELECT session_string FROM accounts WHERE phone = ? AND user_id = ?", (phone, user_id))
 
     if not row:
@@ -276,9 +280,9 @@ async def process_session_file_input(message: Message, state: FSMContext):
 @router.message(F.document)
 async def handle_loose_forwarded_session(message: Message):
     user_id = message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
+    role = await db_mgr.get_user_role(user_id) or "user"
     
-    if not message.document.file_name.endswith(".session"):
+    if role == "banned" or not message.document.file_name.endswith(".session"):
         return
 
     status_msg = await message.answer("📥 **Loose Session File Detected: Validating session...**")
@@ -437,7 +441,7 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
 # --- ADMINISTRATIVE CMDS ---
 @router.message(Command("addadmin"))
 async def cmd_add_admin(message: Message):
-    role = await db_mgr.get_user_role(message.from_user.id)
+    role = await db_mgr.get_user_role(message.from_user.id) or "user"
     if role not in ["owner", "super_owner"]:
         await message.answer("🚫 Access Denied: Insufficient authorization profiles.")
         return
@@ -464,7 +468,7 @@ async def cmd_add_admin(message: Message):
 
 @router.message(Command("removeadmin"))
 async def cmd_remove_admin(message: Message):
-    role = await db_mgr.get_user_role(message.from_user.id)
+    role = await db_mgr.get_user_role(message.from_user.id) or "user"
     if role not in ["owner", "super_owner"]:
         await message.answer("🚫 Access Denied.")
         return
@@ -487,7 +491,7 @@ async def cmd_remove_admin(message: Message):
 
 @router.message(Command("banuser"))
 async def cmd_ban_user(message: Message):
-    role = await db_mgr.get_user_role(message.from_user.id)
+    role = await db_mgr.get_user_role(message.from_user.id) or "user"
     if role not in ["admin", "owner", "super_owner"]:
         await message.answer("🚫 Access Denied.")
         return
@@ -510,7 +514,7 @@ async def cmd_ban_user(message: Message):
 
 @router.message(Command("unbanuser"))
 async def cmd_unban_user(message: Message):
-    role = await db_mgr.get_user_role(message.from_user.id)
+    role = await db_mgr.get_user_role(message.from_user.id) or "user"
     if role not in ["admin", "owner", "super_owner"]:
         await message.answer("🚫 Access Denied.")
         return
@@ -528,7 +532,7 @@ async def cmd_unban_user(message: Message):
 
 @router.message(Command("deletenumber"))
 async def cmd_delete_number(message: Message):
-    role = await db_mgr.get_user_role(message.from_user.id)
+    role = await db_mgr.get_user_role(message.from_user.id) or "user"
     if role not in ["admin", "owner", "super_owner"]:
         await message.answer("🚫 Access Denied.")
         return
@@ -550,7 +554,7 @@ async def cmd_delete_number(message: Message):
 
 @router.message(Command("deleteuser"))
 async def cmd_delete_user(message: Message):
-    role = await db_mgr.get_user_role(message.from_user.id)
+    role = await db_mgr.get_user_role(message.from_user.id) or "user"
     if role not in ["owner", "super_owner"]:
         await message.answer("🚫 Access Denied.")
         return
@@ -576,7 +580,7 @@ async def cmd_delete_user(message: Message):
 
 @router.message(Command("export_session"))
 async def cmd_export_session(message: Message):
-    role = await db_mgr.get_user_role(message.from_user.id)
+    role = await db_mgr.get_user_role(message.from_user.id) or "user"
     if role not in ["admin", "owner", "super_owner"]:
         await message.answer("🚫 Access Denied.")
         return
@@ -726,7 +730,6 @@ async def process_dm_text(message: Message, state: FSMContext):
 async def finalize_task_creation(message: Message, state: FSMContext):
     data = await state.get_data()
     
-    # Context-agnostic extractors for runtime compatibility between message types
     if isinstance(message, Message):
         user_id = message.chat.id
         username = message.from_user.username or "Unknown"
@@ -740,13 +743,11 @@ async def finalize_task_creation(message: Message, state: FSMContext):
     if link_msg_id:
         data["msg_id"] = link_msg_id
 
-    # Create task entries inside core architecture structures
     task_id = await db_mgr.create_task(user_id, task_type, data)
     await task_engine.add_task(task_id, user_id, task_type, data)
 
     await db_mgr.execute_write("INSERT INTO logs (user_id, action) VALUES (?, ?)", (user_id, f"Queued task #{task_id}"))
     
-    # Frame extra parameters dynamically depending on operation types without touching DB schemas
     extra_details = ""
     if task_type == "react":
         mode = data.get("react_mode", "standard")
@@ -757,7 +758,6 @@ async def finalize_task_creation(message: Message, state: FSMContext):
     elif task_type == "dm":
         extra_details = f"\n▪️ **Message Contents:** `{data.get('text', 'N/A')}`"
 
-    # Forward comprehensive tactical deployment log directly to the channel via dispatch_log
     channel_log_payload = (
         f"⚡ **Automation Pipeline Initialized**\n"
         f"▪️ **Task Ref Reference:** `#{task_id}`\n"
@@ -779,11 +779,12 @@ async def finalize_task_creation(message: Message, state: FSMContext):
 @router.callback_query(F.data == "view_tasks")
 async def view_tasks(callback: CallbackQuery):
     user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
+    role = await db_mgr.get_user_role(user_id) or "user"
     
     if role in ["super_owner", "admin", "owner"]:
         rows = await db_mgr.execute_read_all("SELECT task_id, type, status, progress, creator_id FROM tasks ORDER BY task_id DESC LIMIT 15")
     else:
+        # Regular users only see tasks they generated
         rows = await db_mgr.execute_read_all("SELECT task_id, type, status, progress, creator_id FROM tasks WHERE creator_id = ? ORDER BY task_id DESC LIMIT 10", (user_id,))
 
     text = "📊 **Operations Pipeline Log Engine**\n\n"
@@ -798,7 +799,7 @@ async def view_tasks(callback: CallbackQuery):
 @router.message(F.text.startswith("/taskreport_"))
 async def cmd_task_report(message: Message):
     user_id = message.from_user.id
-    role = await db_mgr.get_user_role(user_id)
+    role = await db_mgr.get_user_role(user_id) or "user"
     try:
         task_id = int(message.text.split("_")[1])
     except:
@@ -843,7 +844,7 @@ async def cmd_task_report(message: Message):
 @router.callback_query(F.data.startswith("abort_task:"))
 async def handle_abort_task(callback: CallbackQuery):
     user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
+    role = await db_mgr.get_user_role(user_id) or "user"
     task_id = int(callback.data.split(":")[1])
     
     row = await db_mgr.execute_read_one("SELECT creator_id, status FROM tasks WHERE task_id = ?", (task_id,))
@@ -892,6 +893,10 @@ async def view_referrals(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_panel")
 async def handle_admin_panel(callback: CallbackQuery):
+    role = await db_mgr.get_user_role(callback.from_user.id) or "user"
+    if role not in ["admin", "owner", "super_owner"]:
+        await callback.answer("🚫 Access Denied.", show_alert=True)
+        return
     await callback.message.edit_text(
         "🛠️ **Administrative Control Console**\n\n"
         "• `/addadmin <id> <limit>`\n• `/removeadmin <id>`\n• `/banuser <id>`\n"
@@ -902,6 +907,10 @@ async def handle_admin_panel(callback: CallbackQuery):
 
 @router.callback_query(F.data == "backup_panel")
 async def backup_panel(callback: CallbackQuery):
+    role = await db_mgr.get_user_role(callback.from_user.id) or "user"
+    if role not in ["owner", "super_owner"]:
+        await callback.answer("🚫 Access Denied.", show_alert=True)
+        return
     await callback.message.edit_text("💾 **Core Database Exporter**", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 Download DB", callback_data="export_db")],
         [InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]
@@ -909,6 +918,10 @@ async def backup_panel(callback: CallbackQuery):
 
 @router.callback_query(F.data == "export_db")
 async def export_db(callback: CallbackQuery):
+    role = await db_mgr.get_user_role(callback.from_user.id) or "user"
+    if role not in ["owner", "super_owner"]:
+        await callback.answer("🚫 Access Denied.", show_alert=True)
+        return
     try:
         with open(db_mgr.db_path, "rb") as f:
             file_data = f.read()
@@ -918,6 +931,10 @@ async def export_db(callback: CallbackQuery):
 
 @router.callback_query(F.data == "system_stats")
 async def system_stats(callback: CallbackQuery):
+    role = await db_mgr.get_user_role(callback.from_user.id) or "user"
+    if role not in ["owner", "super_owner"]:
+        await callback.answer("🚫 Access Denied.", show_alert=True)
+        return
     row_users = await db_mgr.execute_read_one("SELECT COUNT(*) FROM users")
     row_accs = await db_mgr.execute_read_one("SELECT COUNT(*) FROM accounts")
     
