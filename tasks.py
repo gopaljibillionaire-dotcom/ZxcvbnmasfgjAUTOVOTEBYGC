@@ -1,233 +1,216 @@
+"""
+Multi-Account Automation Framework - Dynamic Task Queue Worker
+"""
 import asyncio
-import random
 import json
 import logging
-import aiosqlite
-from typing import Dict, Optional
+import random
+from typing import Dict, Any, List, Tuple
 from aiogram import Bot
-
 from telethon import TelegramClient, functions, types as tg_types
 from telethon.sessions import StringSession
-from telethon.errors import (
-    AuthKeyUnregisteredError,
-    UserDeactivatedError,
-    FloodWaitError
-)
+from telethon.errors import FloodWaitError
 
-from config import API_ID, API_HASH
+import config
 from database import db_mgr
-from helpers import decrypt_data, parse_telegram_link, SecurityHubLogger
+from helpers import decrypt_data, parse_telegram_link, dispatch_log
 
-logger = logging.getLogger("MultiAccountSystem.Tasks")
+logger = logging.getLogger("TaskWorkerEngine")
 
 class TaskQueue:
-    def __init__(self):
-        self.queue = asyncio.Queue()
-        self.current_tasks: Dict[int, asyncio.Task] = {}
-        self.bot_instance: Optional[Bot] = None
+    def __init__(self, bot: Bot):
+        self.bot = bot
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.active_workers: Dict[int, asyncio.Task] = {}
 
-    def set_bot(self, bot: Bot):
-        self.bot_instance = bot
-
-    async def add_task(self, task_id: int, creator_id: int, task_type: str, payload: dict):
+    async def add_task(self, task_id: int, creator_id: int, task_type: str, payload: dict) -> None:
+        """Pushes a raw task configuration onto the execution queue."""
         await self.queue.put((task_id, creator_id, task_type, payload))
-        if self.bot_instance:
-            await SecurityHubLogger.log_task_submission(self.bot_instance, task_id, creator_id, task_type, payload)
+        logger.info(f"Task #{task_id} loaded into RAM queue.")
 
-    async def start_worker(self):
-        logger.info("Anti-Ban Task pipeline processing loop started.")
+    async def start_worker(self) -> None:
+        """Continuous listener loop that runs pending actions."""
+        logger.info("Initializing Task Queue daemon worker...")
         while True:
             try:
                 task_id, creator_id, task_type, payload = await self.queue.get()
-                loop_task = asyncio.create_task(self.execute_task(task_id, creator_id, task_type, payload))
-                self.current_tasks[task_id] = loop_task
+                worker = asyncio.create_task(self._execute_task(task_id, creator_id, task_type, payload))
+                self.active_workers[task_id] = worker
+                
                 try:
-                    await loop_task
-                except asyncio.CancelledError:
-                    logger.info(f"Task {task_id} execution was explicitly cancelled.")
-                except Exception as e:
-                    logger.error(f"Execution failure on task {task_id}: {e}")
+                    await worker
+                except Exception as ex:
+                    logger.error(f"Task #{task_id} raised unhandled exception: {ex}")
                 finally:
-                    self.current_tasks.pop(task_id, None)
+                    self.active_workers.pop(task_id, None)
                     self.queue.task_done()
+            except asyncio.CancelledError:
+                logger.warning("Queue worker daemon received shut down instruction.")
+                break
             except Exception as e:
-                logger.error(f"Error in task queue worker loop: {e}")
-                await asyncio.sleep(1)
+                logger.critical(f"Queue worker crashed: {e}. Recovering in 5s...")
+                await asyncio.sleep(5)
 
-    async def execute_task(self, task_id: int, creator_id: int, task_type: str, payload: dict):
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            async with db.execute("SELECT phone, session_string FROM accounts WHERE status = 'active'") as cursor:
-                accounts = await cursor.fetchall()
+    async def _execute_task(self, task_id: int, creator_id: int, task_type: str, payload: dict) -> None:
+        """Coordinates and executes an automation task across active accounts."""
+        logger.info(f"Processing Task #{task_id} ({task_type.upper()})...")
+        await db_mgr.execute_write("UPDATE tasks SET status = 'running', progress = '0%' WHERE task_id = ?", (task_id,))
 
-        if not accounts:
-            logger.warning(f"Task {task_id} aborted: Zero active sessions found.")
-            async with aiosqlite.connect(db_mgr.db_path) as db:
-                await db.execute("UPDATE tasks SET status = 'failed', progress = 'No active accounts connected' WHERE task_id = ?", (task_id,))
-                await db.commit()
+        user_role = await db_mgr.get_user_role(creator_id)
+        
+        # 1. Fetch sessions matching the user's privilege level
+        if user_role in ["admin", "owner", "super_owner"]:
+            raw_sessions = await db_mgr.execute_read_all("SELECT phone, session_string FROM accounts WHERE status = 'active'")
+        else:
+            raw_sessions = await db_mgr.execute_read_all("SELECT phone, session_string FROM accounts WHERE status = 'active' AND user_id = ?", (creator_id,))
+
+        if not raw_sessions:
+            await db_mgr.complete_task(
+                task_id=task_id,
+                status="failed",
+                progress="0 active accounts found",
+                success_list=[],
+                failure_list=[("System", "No active accounts registered for task execution.")]
+            )
             return
 
-        success_accounts = []
-        failed_accounts = []
-        
-        target_link = payload.get("target", "")
-        parsed_target, msg_ids = parse_telegram_link(target_link)
+        success_phones: List[str] = []
+        failure_phones: List[Tuple[str, str]] = []
+        total_accounts = len(raw_sessions)
 
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            await db.execute("UPDATE tasks SET status = 'running', progress = '0%' WHERE task_id = ?", (task_id,))
-            await db.commit()
-
-        total_accounts = len(accounts)
-        
-        for index, (phone, enc_session) in enumerate(accounts):
-            if asyncio.current_task().cancelled():
-                raise asyncio.CancelledError()
-
-            decrypted_session = decrypt_data(enc_session)
-            if not decrypted_session:
-                failed_accounts.append((phone, "Decryption Error"))
-                continue
-
-            client = TelegramClient(StringSession(decrypted_session), API_ID, API_HASH)
+        # 2. Sequential/Batch Execution
+        for index, (phone, enc_session) in enumerate(raw_sessions):
+            session_str = decrypt_data(enc_session)
+            client = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
+            
             try:
+                # Randomized minor initial stagger delay to mimic human login patterns
+                await asyncio.sleep(random.uniform(1.0, 2.5))
                 await client.connect()
+                
                 if not await client.is_user_authorized():
-                    raise AuthKeyUnregisteredError("Session deactivated or expired.")
+                    await db_mgr.update_account_status(phone, "dead")
+                    failure_phones.append((phone, "Session expired/Unauthorized"))
+                    continue
 
+                target = payload.get("target", "")
+                parsed_target, link_msg_id, is_private_hash = parse_telegram_link(target)
+                msg_id = int(payload.get("msg_id", link_msg_id or 0))
+
+                # Humanized pre-action delay
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+
+                # 3. Action routing
                 if task_type == "join":
-                    if isinstance(parsed_target, str) and (len(parsed_target) == 22 or not parsed_target.isalnum()):
+                    if is_private_hash:
                         await client(functions.messages.ImportChatInviteRequest(hash=parsed_target))
                     else:
                         await client(functions.channels.JoinChannelRequest(channel=parsed_target))
-                
+                        
                 elif task_type == "leave":
                     await client(functions.channels.LeaveChannelRequest(channel=parsed_target))
-                
+                    
                 elif task_type == "react":
-                    if not msg_ids:
-                        raise ValueError("No valid message target ID specified for reactions.")
+                    react_mode = payload.get("react_mode", "standard")
+                    emojis = payload.get("reactions", ["👍"])
                     
-                    reactions_list = payload.get("reactions", [])
-                    random_match = payload.get("random_match", False)
-
-                    for msg_id in msg_ids:
-                        if random_match:
-                            msg_objs = await client.get_messages(parsed_target, ids=[msg_id])
-                            if msg_objs and msg_objs[0].reactions:
-                                available = [r.reaction.emoj for r in msg_objs[0].reactions.results if hasattr(r.reaction, 'emoj')]
-                                chosen_emoji = random.choice(available) if available else "👍"
+                    if react_mode == "random":
+                        assigned_emoji = random.choice(config.REACTION_EMOJIS)
+                    elif react_mode == "existing_reactions":
+                        try:
+                            msg = await client.get_messages(parsed_target, ids=msg_id)
+                            if msg and msg.reactions and msg.reactions.results:
+                                active_reactions = [
+                                    r.reaction.emoticon for r in msg.reactions.results 
+                                    if hasattr(r.reaction, 'emoticon')
+                                ]
+                                assigned_emoji = random.choice(active_reactions) if active_reactions else random.choice(emojis)
                             else:
-                                chosen_emoji = "👍"
-                        else:
-                            chosen_emoji = random.choice(reactions_list) if reactions_list else "👍"
-                            
-                        await client(functions.messages.SendReactionRequest(
-                            peer=parsed_target,
-                            msg_id=msg_id,
-                            reaction=[tg_types.ReactionEmoji(emoj=chosen_emoji)]
-                        ))
-                        await asyncio.sleep(0.5)
+                                assigned_emoji = random.choice(emojis)
+                        except Exception as fetch_err:
+                            logger.warning(f"Failed fetching reaction counts: {fetch_err}. Defaulting to choice array.")
+                            assigned_emoji = random.choice(emojis)
+                    else:
+                        assigned_emoji = emojis[index % len(emojis)]
 
-                elif task_type == "button_vote":
-                    if not msg_ids:
-                        raise ValueError("No valid message target ID specified for inline buttons.")
-                    
-                    target_msg_id = msg_ids[0]
-                    button_text = payload.get("button_text", "")
-                    msg_objs = await client.get_messages(parsed_target, ids=[target_msg_id])
-                    
-                    if not msg_objs or not msg_objs[0].reply_markup:
-                        raise ValueError("No inline markup found on this post link.")
+                    await client(functions.messages.SendReactionRequest(
+                        peer=parsed_target,
+                        msg_id=msg_id,
+                        reaction=[tg_types.ReactionEmoji(emoticon=assigned_emoji)]
+                    ))
                         
-                    clicked = False
-                    for row in msg_objs[0].reply_markup.rows:
-                        for button in row.buttons:
-                            if button_text.lower() in button.text.lower():
-                                if isinstance(button, tg_types.KeyboardButtonCallback):
-                                    await client(functions.messages.GetBotCallbackAnswerRequest(
-                                        peer=parsed_target,
-                                        msg_id=target_msg_id,
-                                        data=button.data
-                                    ))
-                                else:
-                                    await msg_objs[0].click(button)
-                                clicked = True
+                elif task_type == "button_vote":
+                    button_text = payload.get("button_text", "").strip().lower()
+                    msg = await client.get_messages(parsed_target, ids=msg_id)
+                    if msg and msg.reply_markup:
+                        target_button = None
+                        for row in msg.reply_markup.rows:
+                            for btn in row.buttons:
+                                if button_text in btn.text.strip().lower():
+                                    target_button = btn
+                                    break
+                            if target_button:
                                 break
-                        if clicked:
-                            break
-                    if not clicked:
-                        raise ValueError(f"Target button with label containing '{button_text}' not found.")
-
+                                
+                        if target_button and isinstance(target_button, tg_types.KeyboardButtonCallback):
+                            await client(functions.messages.GetBotCallbackAnswerRequest(
+                                peer=parsed_target,
+                                msg_id=msg_id,
+                                data=target_button.data
+                            ))
+                        else:
+                            raise ValueError(f"No match for callback text '{button_text}'.")
+                    else:
+                        raise ValueError("Target message does not contain inline keyboard buttons.")
+                        
                 elif task_type == "dm":
-                    dm_text = payload.get("text", "Hello!")
-                    await client.send_message(parsed_target, dm_text)
+                    message_text = payload.get("text", "Hello!")
+                    await client.send_message(parsed_target, message_text)
 
-                success_accounts.append(phone)
+                success_phones.append(phone)
                 
-            except (AuthKeyUnregisteredError, UserDeactivatedError):
-                failed_accounts.append((phone, "Dead Session"))
-                async with aiosqlite.connect(db_mgr.db_path) as db_flag:
-                    await db_flag.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
-                    await db_flag.commit()
-            except FloodWaitError as e:
-                failed_accounts.append((phone, f"FloodWait limit: {e.seconds}s"))
-            except Exception as e:
-                failed_accounts.append((phone, str(e)))
+            except FloodWaitError as fwe:
+                failure_phones.append((phone, f"Rate limited: wait {fwe.seconds}s"))
+                # If rate-limiting strikes, wait briefly without locking up the entire system
+                await asyncio.sleep(min(fwe.seconds, 15))
+            except Exception as action_ex:
+                failure_phones.append((phone, str(action_ex)))
+                logger.error(f"Error executing on phone +{phone}: {action_ex}")
             finally:
                 await client.disconnect()
 
-            await asyncio.sleep(random.uniform(2.5, 5.0))
-            
-            progress_percent = f"{int(((index + 1) / total_accounts) * 100)}%"
-            async with aiosqlite.connect(db_mgr.db_path) as db:
-                await db.execute("UPDATE tasks SET progress = ? WHERE task_id = ?", (progress_percent, task_id))
-                await db.commit()
-
-        report_lines = [
-            f"=== PRODUCTION LOG REPORT FOR RUNTIME TASK {task_id} ===",
-            f"⚡ TASK INSTANCE TYPE: {task_type.upper()}",
-            f"👤 OWNER ARCHITECTURE PROFILE: ID {creator_id}",
-            f"\n🟢 SUCCESSFUL AUTOMATIONS ({len(success_accounts)}):"
-        ]
-        for s in success_accounts:
-            report_lines.append(f" - +{s}: COMPLETE OPERATION ACTION")
-        report_lines.append(f"\n🔴 CRITICAL FAILURES SUMMARY ({len(failed_accounts)}):")
-        for f_phone, reason in failed_accounts:
-            report_lines.append(f" - +{f_phone}: DECLINED | Trigger Exception: {reason}")
-            
-        full_report_text = "\n".join(report_lines)
-        
-        final_status = "completed" if success_accounts else "failed"
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            await db.execute(
-                "UPDATE tasks SET status = ?, progress = '100%', success_report = ?, failure_report = ? WHERE task_id = ?",
-                (final_status, json.dumps(success_accounts), json.dumps(failed_accounts), task_id)
-            )
-            await db.commit()
-            
-        if self.bot_instance:
-            await SecurityHubLogger.log_task_completion(
-                self.bot_instance, task_id, creator_id, task_type, 
-                len(success_accounts), len(failed_accounts), full_report_text
-            )
-
-    async def cancel_specific_task(self, task_id: int) -> bool:
-        if task_id in self.current_tasks:
-            self.current_tasks[task_id].cancel()
-            return True
-            
-        found = False
-        temp_list = []
-        while not self.queue.empty():
-            item = await self.queue.get()
-            if item[0] == task_id:
-                found = True
-                self.queue.task_done()
+            # 4. Anti-Ban cooldown batching logic
+            if (index + 1) % config.BATCH_SIZE == 0 and (index + 1) < total_accounts:
+                cooldown_time = config.BASE_COOLDOWN + random.randint(5, 15)
+                logger.info(f"Task #{task_id}: Batch threshold met. Cooling down for {cooldown_time}s...")
+                await asyncio.sleep(cooldown_time)
             else:
-                temp_list.append(item)
-                
-        for item in temp_list:
-            await self.queue.put(item)
-            
-        return found
+                await asyncio.sleep(random.uniform(config.MIN_ACCOUNT_DELAY, config.MAX_ACCOUNT_DELAY))
 
-task_queue = TaskQueue()
+            # Progress updater
+            progress_pct = f"{int(((index + 1) / total_accounts) * 100)}%"
+            await db_mgr.update_task_progress(task_id, progress_pct)
+
+        # 5. Compile and finalize task reports
+        final_status = "completed" if success_phones else "failed"
+        final_progress = f"{len(success_phones)}/{total_accounts} Passed"
+        
+        await db_mgr.complete_task(
+            task_id=task_id,
+            status=final_status,
+            progress=final_progress,
+            success_list=success_phones,
+            failure_list=failure_phones
+        )
+
+        # Send execution details to your private audit logging channel
+        await dispatch_log(
+            self.bot,
+            f"📋 **Task Complete Report**\n\n"
+            f"🆔 **Task ID:** `#{task_id}`\n"
+            f"⚙️ **Type:** `{task_type.upper()}`\n"
+            f"👤 **Initiator ID:** `{creator_id}`\n"
+            f"📊 **Final Output:** `{final_progress}`\n"
+            f"🟢 **Successes:** `{len(success_phones)}`\n"
+            f"🔴 **Failures:** `{len(failure_phones)}`"
+        )
