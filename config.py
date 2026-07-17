@@ -12,7 +12,7 @@ logger = logging.getLogger("MultiAccountSystem")
 
 # --- CREDENTIALS ---
 API_ID = int(os.getenv("TG_API_ID", "34043431"))
-API_HASH = os.getenv("TG_API_HASH","1b35dae0978194f1088cb6168b70779c")
+API_HASH = os.getenv("TG_API_HASH", "1b35dae0978194f1088cb6168b70779c")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8733721396:AAHJrr4uHC2WEx5r6BCHqBmx4LbMKh1Ngds")
 
 # HARDCODED SUPER-OWNER IDS
@@ -26,4 +26,4 @@ MANAGER_HANDLE = "BMWM4Z"
 SECRET_KEY = os.getenv("ENCRYPTION_KEY", "secure_fallback_key_2026")
 
 # AUDIT CHANNEL FOR TELEGRAM LOG EVENTS
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1004349607766")
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1004349607766"))
