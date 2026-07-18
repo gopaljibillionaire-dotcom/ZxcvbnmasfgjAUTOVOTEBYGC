@@ -148,7 +148,6 @@ class Database:
         
         if bot_instance and config.LOG_CHANNEL_ID:
             try:
-                # Kept clean and high-level as requested
                 log_text = (
                     f"📝 **System Audit Log**\n"
                     f"👤 **User ID:** `{user_id}`\n"
@@ -186,7 +185,7 @@ db_mgr = Database()
 registration_sessions: Dict[int, Dict[str, Any]] = {}
 bot_username: str = "bot"
 
-# --- CONCURRENT CONTEXT WORKER ENGINE ---
+# --- CONCURRENT TASK MANAGER ENGINE ---
 class TaskQueue:
     def __init__(self):
         self.queue = asyncio.Queue()
@@ -270,7 +269,6 @@ class TaskQueue:
         failed_ids: List[Tuple[str, str]] = []
         total_accounts = len(clients_data)
         
-        # Concurrency Controls for High Performance and Speed
         semaphore = asyncio.Semaphore(10) 
         progress_counter = 0
 
@@ -279,7 +277,6 @@ class TaskQueue:
             async with semaphore:
                 client = TelegramClient(StringSession(enc_session), config.API_ID, config.API_HASH)
                 try:
-                    # Light staggered startup bounds for connection protection
                     await asyncio.sleep(random.uniform(0.1, 0.5))
                     await client.connect()
                     if not await client.is_user_authorized():
@@ -305,7 +302,6 @@ class TaskQueue:
                     do_dm = task_type == "dm"
                     do_refer = task_type == "refer"
 
-                    # Automatically handle joining if targeting channel specific operations
                     if do_join:
                         try:
                             if isinstance(parsed_channel, str) and ("/+" in channel_target or "joinchat/" in channel_target or channel_target.startswith("+")):
@@ -313,7 +309,7 @@ class TaskQueue:
                             else:
                                 await client(functions.channels.JoinChannelRequest(channel=parsed_channel or parsed_target))
                         except Exception as je:
-                            logger.debug(f"Join optional handled or already member: {je}")
+                            logger.debug(f"Join context handled: {je}")
 
                     if do_view and msg_id:
                         await client(functions.messages.GetMessagesViewsRequest(
@@ -351,9 +347,9 @@ class TaskQueue:
                                     data=target_button.data
                                 ))
                             else:
-                                raise ValueError("Button string signature not matching target.")
+                                raise ValueError("Target button identifier matching failed.")
                         else:
-                            raise ValueError("No inline interactive component markup found.")
+                            raise ValueError("No layout signatures available.")
 
                     if do_dm:
                         message_text = payload.get("text", "Hello!")
@@ -387,7 +383,6 @@ class TaskQueue:
                         await db_update.execute("UPDATE tasks SET progress = ? WHERE task_id = ?", (progress_pct, task_id))
                         await db_update.commit()
 
-        # Execute all structural tasks concurrently via event loop gathering
         await asyncio.gather(*(worker_session(phone, enc, i) for i, (phone, enc) in enumerate(clients_data)))
 
         status = "completed" if len(passed_ids) > 0 else "failed"
@@ -401,7 +396,6 @@ class TaskQueue:
             )
             await db.commit()
 
-        # Simplified high-level metric audit logs
         await db_mgr.log_action(
             creator_id, 
             f"Executed task #{task_id} ({task_type.upper()}). Metrics: {len(passed_ids)} Passed, {len(failed_ids)} Failed.", 
@@ -427,9 +421,22 @@ class TaskWizardStates(StatesGroup):
     waiting_for_dm_text = State()
 
 # --- UI KEYBOARD GENERATORS ---
-REACTION_EMOJIS = ["👍", "👎", "🔥", "🎉", "👏", "🥰", "😮", "😢", "😡", "💩", "🤩", "🤔", "👀", "💯", "🤣"]
+# Expanded Popular Telegram Reactions & Hearts Matrix
+REACTION_EMOJIS = [
+    "🔥", "❤️", "💖", "💘", "💝",
+    "👍", "👏", "🎉", "🤩", "💯",
+    "⚡", "🍓", "💋", "🍿", "🏆",
+    "🤣", "🥰", "🤔", "👀", "😎",
+    "🦄", "🍬", "🎈", "🔮", "💎"
+]
 
-def get_emoji_selection_keyboard(selected_emojis: List[str], existing_reactions: Optional[List[str]] = None) -> InlineKeyboardMarkup:
+def get_post_registration_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Add Another Account", callback_data="add_account_phone")],
+        [InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu")]
+    ])
+
+def get_emoji_selection_keyboard(selected_emojis: List[str]) -> InlineKeyboardMarkup:
     keyboard = []
     row = []
     for emoji in REACTION_EMOJIS:
@@ -437,7 +444,7 @@ def get_emoji_selection_keyboard(selected_emojis: List[str], existing_reactions:
         suffix = " ✅" if is_selected else ""
         btn_text = f"{emoji}{suffix}"
         row.append(InlineKeyboardButton(text=btn_text, callback_data=f"toggle_emoji:{emoji}"))
-        if len(row) == 3:  
+        if len(row) == 5:  
             keyboard.append(row)
             row = []
     if row:
@@ -461,18 +468,6 @@ def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton(text="💾 Database Core Backups", callback_data="backup_panel")])
         buttons.append([InlineKeyboardButton(text="📈 System Performance Analytics", callback_data="system_stats")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_task_types_keyboard(active_count: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [[InlineKeyboardButton(text="React Only", callback_data="set_type:react")], [InlineKeyboardButton(text="Vote Only", callback_data="set_type:vote")]],
-        [[InlineKeyboardButton(text="React + Vote", callback_data="set_type:react_vote")], [InlineKeyboardButton(text="View Only", callback_data="set_type:view")]],
-        [[InlineKeyboardButton(text="React + View", callback_data="set_type:react_view")], [InlineKeyboardButton(text="Vote + View", callback_data="set_type:vote_view")]],
-        [[InlineKeyboardButton(text="React + Vote + View", callback_data="set_type:react_vote_view")]],
-        [[InlineKeyboardButton(text="Join Channel", callback_data="set_type:join")], [InlineKeyboardButton(text="📄 Leave Channel", callback_data="set_type:leave")]],
-        [[InlineKeyboardButton(text="Bulk DM", callback_data="set_type:dm")]],
-        [[InlineKeyboardButton(text="🔗 Refer", callback_data="set_type:refer")], [InlineKeyboardButton(text="⚡ Speed", callback_data="set_type:speed")]],
-        [[InlineKeyboardButton(text="Cancel", callback_data="main_menu")]]
-    ][0]) # Correct structural unpack mapping matrix
 
 def get_task_types_keyboard(active_count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -589,9 +584,8 @@ async def handle_purge_dead_accounts(callback: CallbackQuery, bot: Bot):
             await db.execute("DELETE FROM accounts WHERE status = 'dead'")
         else:
             await db.execute("DELETE FROM accounts WHERE status = 'dead' AND user_id = ?", (user_id,))
-        changes = db.total_changes
         await db.commit()
-    await callback.answer(f"🔥 Successfully purged dead logs!", show_alert=True)
+    await callback.answer("🔥 Successfully purged dead logs!", show_alert=True)
     await list_user_accounts(callback, bot)
 
 # --- LINK NEW ACCOUNT VIA OTP ---
@@ -623,6 +617,7 @@ async def process_otp(message: Message, state: FSMContext, bot: Bot):
     otp = message.text.strip()
     reg_data = registration_sessions.get(user_id)
     if not reg_data:
+        await message.answer("❌ Session expired. Please start registration again using the main panel.")
         await state.clear()
         return
 
@@ -630,11 +625,14 @@ async def process_otp(message: Message, state: FSMContext, bot: Bot):
     try:
         await client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
         await complete_registration(message, state, client, phone, user_id, bot)
+    except PhoneCodeInvalidError:
+        # Retains state configuration context loops so users don't have to restart
+        await message.answer("❌ **OTP Invalid / Expired!** Please send the new code correctly:")
     except SessionPasswordNeededError:
         await message.answer("🔒 Enter 2FA Password:")
         await state.set_state(RegistrationStates.waiting_for_2fa)
     except Exception as e:
-        await message.answer(f"❌ Failed: {str(e)}")
+        await message.answer(f"❌ Failed authentication framework logic: {str(e)}")
         await client.disconnect()
         await state.clear()
 
@@ -664,7 +662,12 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
                 VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
             """, (phone.replace("+", ""), user_id, me.username or "None", encrypted_session))
             await db.commit()
-        await message.answer(f"🎉 Verified account `+{phone}` successfully.")
+        
+        # Provides instant follow-up routing options immediately
+        await message.answer(
+            f"🎉 Verified account `+{phone}` successfully!\nChoose an action vector below to proceed:", 
+            reply_markup=get_post_registration_keyboard()
+        )
     except Exception as e:
         await message.answer(f"❌ Reg failure: {str(e)}")
     finally:
@@ -714,7 +717,11 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
             """, (phone.replace("+", ""), user_id, me.username or "None", encrypted_session))
             await db.commit()
 
-        await message.answer(f"🎉 Integrated `+{phone}` successfully.")
+        # Follow-up options to allow adding another session file immediately
+        await message.answer(
+            f"🎉 Integrated `+{phone}` profile securely!\nChoose an action vector below to proceed:",
+            reply_markup=get_post_registration_keyboard()
+        )
         await client.disconnect()
     except Exception as e:
         await message.answer(f"❌ Failure: {e}")
@@ -871,7 +878,7 @@ async def export_db(callback: CallbackQuery, bot: Bot):
     except Exception as e:
         await callback.message.answer(f"❌ Error: {e}")
 
-# --- SEQUENTIAL TASK WIZARD FLOW ---
+# --- TASK WIZARD INTERFACE FLOW ---
 @router.callback_query(F.data == "task_hub_start")
 async def task_hub_select_type(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await callback.answer()
@@ -901,7 +908,6 @@ async def task_hub_process_type(callback: CallbackQuery, state: FSMContext):
     task_type = callback.data.split(":")[1]
     await state.update_data(task_type=task_type)
     
-    # Clearly separated steps to capture channel parameters vs message parameters sequentially
     if "react" in task_type or "vote" in task_type or task_type in ["view", "speed"]:
         await callback.message.edit_text("📢 **Step 2: Enter Target Channel Link / Username**\n(e.g., `https://t.me/example_channel` or `@example_channel`):")
         await state.set_state(TaskWizardStates.waiting_for_channel_link)
@@ -931,10 +937,10 @@ async def task_hub_process_target(message: Message, state: FSMContext, bot: Bot)
     if task_type in ["join", "leave", "refer", "view", "speed"]:
         await finalize_task_creation(message, state, bot)
     elif "react" in task_type:
-        await state.update_data(selected_emojis=[], existing_reactions=[])
+        await state.update_data(selected_emojis=[])
         await message.answer(
-            "🎭 **Choose Emojis to Distribute:**\nSelect destinations below:",
-            reply_markup=get_emoji_selection_keyboard([], [])
+            "🎭 **Choose Emojis to Distribute:**\nSelect from the popular reaction matrix below:",
+            reply_markup=get_emoji_selection_keyboard([])
         )
         await state.set_state(TaskWizardStates.waiting_for_emojis)
     elif "vote" in task_type:
@@ -955,7 +961,7 @@ async def handle_toggle_emoji(callback: CallbackQuery, state: FSMContext):
     else:
         selected.append(emoji)
     await state.update_data(selected_emojis=selected)
-    await callback.message.edit_reply_markup(reply_markup=get_emoji_selection_keyboard(selected, []))
+    await callback.message.edit_reply_markup(reply_markup=get_emoji_selection_keyboard(selected))
 
 @router.callback_query(StateFilter(TaskWizardStates.waiting_for_emojis), F.data == "finish_emoji_selection")
 async def finish_emoji_selection(callback: CallbackQuery, state: FSMContext, bot: Bot):
