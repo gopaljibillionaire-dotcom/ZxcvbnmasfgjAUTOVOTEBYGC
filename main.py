@@ -290,7 +290,6 @@ class TaskQueue:
 
                 await asyncio.sleep(random.uniform(1.0, 2.5))
 
-                # Determine active operations based on the new custom task matrix configuration mapping
                 do_react = "react" in task_type
                 do_vote = "vote" in task_type
                 do_view = "view" in task_type or task_type == "speed"
@@ -299,7 +298,6 @@ class TaskQueue:
                 do_dm = task_type == "dm"
                 do_refer = task_type == "refer"
 
-                # --- OPERATION EXECUTION PIPELINE MAP ---
                 if do_join:
                     if isinstance(parsed_target, str) and ("/+" in target or "joinchat/" in target or target.startswith("+")):
                         await client(functions.messages.ImportChatInviteRequest(hash=parsed_target))
@@ -418,6 +416,7 @@ class RegistrationStates(StatesGroup):
     waiting_for_otp = State()
     waiting_for_2fa = State()
     waiting_for_session_file = State()
+    waiting_for_db_file = State()  # New state for database integration
 
 class TaskWizardStates(StatesGroup):
     choosing_type = State()
@@ -465,7 +464,6 @@ def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_task_types_keyboard(active_count: int) -> InlineKeyboardMarkup:
-    # Formats buttons to precisely recreate the panel design requested in Photo 2
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="React Only", callback_data="set_type:react"),
@@ -613,6 +611,84 @@ async def handle_purge_dead_accounts(callback: CallbackQuery, bot: Bot):
     await callback.answer(f"🔥 Successfully purged {changes} logs!", show_alert=True)
     await list_user_accounts(callback, bot)
 
+# --- LINK NEW ACCOUNT VIA OTP ---
+@router.callback_query(F.data == "add_account_phone")
+async def add_account_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.edit_text("📞 Enter phone number with country code (e.g. `+123456789`):")
+    await state.set_state(RegistrationStates.waiting_for_phone)
+
+@router.message(StateFilter(RegistrationStates.waiting_for_phone))
+async def process_phone(message: Message, state: FSMContext, bot: Bot):
+    phone = message.text.strip().replace(" ", "").replace("-", "")
+    user_id = message.from_user.id
+    client = TelegramClient(StringSession(), config.API_ID, config.API_HASH)
+    await client.connect()
+    try:
+        sent_code = await client.send_code_request(phone)
+        registration_sessions[user_id] = {"client": client, "phone": phone, "phone_code_hash": sent_code.phone_code_hash}
+        await message.answer("📩 Input the verification code:")
+        await state.set_state(RegistrationStates.waiting_for_otp)
+    except Exception as e:
+        await message.answer(f"❌ Error: {str(e)}")
+        await client.disconnect()
+        await state.clear()
+
+@router.message(StateFilter(RegistrationStates.waiting_for_otp))
+async def process_otp(message: Message, state: FSMContext, bot: Bot):
+    user_id = message.from_user.id
+    otp = message.text.strip()
+    reg_data = registration_sessions.get(user_id)
+    if not reg_data:
+        await state.clear()
+        return
+
+    client, phone, phone_code_hash = reg_data["client"], reg_data["phone"], reg_data["phone_code_hash"]
+    try:
+        await client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
+        await complete_registration(message, state, client, phone, user_id, bot)
+    except SessionPasswordNeededError:
+        await message.answer("🔒 Enter 2FA Password:")
+        await state.set_state(RegistrationStates.waiting_for_2fa)
+    except Exception as e:
+        await message.answer(f"❌ Failed: {str(e)}")
+        await client.disconnect()
+        await state.clear()
+
+@router.message(StateFilter(RegistrationStates.waiting_for_2fa))
+async def process_2fa(message: Message, state: FSMContext, bot: Bot):
+    user_id = message.from_user.id
+    password = message.text.strip()
+    reg_data = registration_sessions.get(user_id)
+    if not reg_data:
+        await state.clear()
+        return
+    try:
+        await reg_data["client"].sign_in(password=password)
+        await complete_registration(message, state, reg_data["client"], reg_data["phone"], user_id, bot)
+    except Exception as e:
+        await message.answer(f"❌ Auth Error: {str(e)}")
+        await reg_data["client"].disconnect()
+        await state.clear()
+
+async def complete_registration(message: Message, state: FSMContext, client: TelegramClient, phone: str, user_id: int, bot: Bot):
+    try:
+        me = await client.get_me()
+        encrypted_session = encrypt_data(client.session.save())
+        async with aiosqlite.connect(db_mgr.db_path) as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
+                VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
+            """, (phone.replace("+", ""), user_id, me.username or "None", encrypted_session))
+            await db.commit()
+        await message.answer(f"🎉 Verified account `+{phone}` successfully.")
+    except Exception as e:
+        await message.answer(f"❌ Reg failure: {str(e)}")
+    finally:
+        await client.disconnect()
+        registration_sessions.pop(user_id, None)
+        await state.clear()
+
 # --- LINK VIA STRING SESSION OR STR FILE ---
 @router.callback_query(F.data == "add_account_session")
 async def add_account_session_start(callback: CallbackQuery, state: FSMContext):
@@ -719,83 +795,103 @@ async def handle_bulk_admin_export(callback: CallbackQuery, bot: Bot):
     backup_file = BufferedInputFile(json.dumps(export_payload, indent=4).encode('utf-8'), filename="accounts_backup.txt")
     await callback.message.reply_document(document=backup_file, caption=f"📦 Exported `{len(export_payload)}` items.")
 
-# --- LINK NEW ACCOUNT VIA OTP ---
-@router.callback_query(F.data == "add_account_phone")
-async def add_account_start(callback: CallbackQuery, state: FSMContext):
+# --- DYNAMIC DB EXTERNAL IMPORT SYSTEM (.DB INTERFACE) ---
+@router.callback_query(F.data == "backup_panel")
+async def backup_panel(callback: CallbackQuery, bot: Bot):
     await callback.answer()
-    await callback.message.edit_text("📞 Enter phone number with country code (e.g. `+123456789`):")
-    await state.set_state(RegistrationStates.waiting_for_phone)
+    buttons = [
+        [InlineKeyboardButton(text="📥 Download Raw DB Image", callback_data="export_db")],
+        [InlineKeyboardButton(text="📂 Import External DB (.db)", callback_data="import_db_start")],
+        [InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="main_menu")]
+    ]
+    await callback.message.edit_text("💾 **Database Core Management Hub**", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
-@router.message(StateFilter(RegistrationStates.waiting_for_phone))
-async def process_phone(message: Message, state: FSMContext, bot: Bot):
-    phone = message.text.strip().replace(" ", "").replace("-", "")
-    user_id = message.from_user.id
-    client = TelegramClient(StringSession(), config.API_ID, config.API_HASH)
-    await client.connect()
-    try:
-        sent_code = await client.send_code_request(phone)
-        registration_sessions[user_id] = {"client": client, "phone": phone, "phone_code_hash": sent_code.phone_code_hash}
-        await message.answer("📩 Input the verification code:")
-        await state.set_state(RegistrationStates.waiting_for_otp)
-    except Exception as e:
-        await message.answer(f"❌ Error: {str(e)}")
-        await client.disconnect()
-        await state.clear()
+@router.callback_query(F.data == "import_db_start")
+async def import_db_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    user_id = callback.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    if role not in ["owner", "super_owner"]:
+        await callback.message.answer("🚫 Only developers/owners can import database frameworks directly.")
+        return
+        
+    await callback.message.edit_text("📤 Please send/upload the target raw structural `.db` file containing user mapping or connection accounts data:")
+    await state.set_state(RegistrationStates.waiting_for_db_file)
 
-@router.message(StateFilter(RegistrationStates.waiting_for_otp))
-async def process_otp(message: Message, state: FSMContext, bot: Bot):
+@router.message(StateFilter(RegistrationStates.waiting_for_db_file), F.document)
+async def process_db_import_file(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    otp = message.text.strip()
-    reg_data = registration_sessions.get(user_id)
-    if not reg_data:
+    
+    if not message.document.file_name.endswith('.db'):
+        await message.answer("❌ Invalid structure context. File must have a `.db` format string extension identifier.")
         await state.clear()
         return
-
-    client, phone, phone_code_hash = reg_data["client"], reg_data["phone"], reg_data["phone_code_hash"]
+        
+    status_msg = await message.answer("⚡ Downloading raw database container...")
+    temp_filename = f"imported_temp_{user_id}.db"
+    
     try:
-        await client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
-        await complete_registration(message, state, client, phone, user_id, bot)
-    except SessionPasswordNeededError:
-        await message.answer("🔒 Enter 2FA Password:")
-        await state.set_state(RegistrationStates.waiting_for_2fa)
-    except Exception as e:
-        await message.answer(f"❌ Failed: {str(e)}")
-        await client.disconnect()
-        await state.clear()
+        file_info = await bot.get_file(message.document.file_id)
+        await bot.download_file(file_info.file_path, destination=temp_filename)
+        
+        await status_msg.edit_text("🔄 Processing matrix records and merging structures safely...")
+        
+        users_merged = 0
+        accounts_merged = 0
+        
+        async with aiosqlite.connect(temp_filename) as source_db:
+            # 1. Parse and migrate global profiles if existing
+            try:
+                async with source_db.execute("SELECT user_id, username, role, max_accounts FROM users") as cursor:
+                    async for row in cursor:
+                        async with aiosqlite.connect(db_mgr.db_path) as current_db:
+                            await current_db.execute("""
+                                INSERT OR IGNORE INTO users (user_id, username, role, max_accounts)
+                                VALUES (?, ?, ?, ?)
+                            """, (row[0], row[1], row[2], row[3]))
+                            await current_db.commit()
+                        users_merged += 1
+            except Exception as users_err:
+                logger.warning(f"Skipping profiles parsing step: {users_err}")
 
-@router.message(StateFilter(RegistrationStates.waiting_for_2fa))
-async def process_2fa(message: Message, state: FSMContext, bot: Bot):
-    user_id = message.from_user.id
-    password = message.text.strip()
-    reg_data = registration_sessions.get(user_id)
-    if not reg_data:
-        await state.clear()
-        return
-    try:
-        await reg_data["client"].sign_in(password=password)
-        await complete_registration(message, state, reg_data["client"], reg_data["phone"], user_id, bot)
-    except Exception as e:
-        await message.answer(f"❌ Auth Error: {str(e)}")
-        await reg_data["client"].disconnect()
-        await state.clear()
+            # 2. Parse and merge absolute account bridge tokens
+            try:
+                async with source_db.execute("SELECT phone, user_id, username, session_string, status FROM accounts") as cursor:
+                    async for row in cursor:
+                        async with aiosqlite.connect(db_mgr.db_path) as current_db:
+                            await current_db.execute("""
+                                INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
+                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                            """, (str(row[0]).replace("+", ""), row[1], row[2], row[3], row[4]))
+                            await current_db.commit()
+                        accounts_merged += 1
+            except Exception as accounts_err:
+                await status_msg.edit_text(f"❌ Failed to parse data from accounts layout node scheme: {accounts_err}")
+                return
 
-async def complete_registration(message: Message, state: FSMContext, client: TelegramClient, phone: str, user_id: int, bot: Bot):
-    try:
-        me = await client.get_me()
-        encrypted_session = encrypt_data(client.session.save())
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            await db.execute("""
-                INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
-                VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
-            """, (phone.replace("+", ""), user_id, me.username or "None", encrypted_session))
-            await db.commit()
-        await message.answer(f"🎉 Verified account `+{phone}` successfully.")
+        await status_msg.edit_text(
+            f"✅ **Database Integration Matrix Complete!**\n\n"
+            f"👤 Profile instances loaded: `{users_merged}`\n"
+            f"📱 Connected session bridges successfully synchronized: `{accounts_merged}`"
+        )
+        await db_mgr.log_action(user_id, f"Merged external storage image snapshot successfully. Accounts appended: {accounts_merged}", bot)
+        
     except Exception as e:
-        await message.answer(f"❌ Reg failure: {str(e)}")
+        await status_msg.edit_text(f"❌ Structural schema validation fault: {e}")
     finally:
-        await client.disconnect()
-        registration_sessions.pop(user_id, None)
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
         await state.clear()
+
+@router.callback_query(F.data == "export_db")
+async def export_db(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    try:
+        with open(db_mgr.db_path, "rb") as f:
+            file = BufferedInputFile(f.read(), filename="database_core_backup.db")
+        await callback.message.reply_document(file, caption="📂 SQLite Snapshot")
+    except Exception as e:
+        await callback.message.answer(f"❌ Error: {e}")
 
 # --- TASK BUILDER WIZARD INTERFACE ---
 @router.callback_query(F.data == "task_hub_start")
@@ -803,7 +899,6 @@ async def task_hub_select_type(callback: CallbackQuery, state: FSMContext, bot: 
     await callback.answer()
     await state.clear()
     
-    # Check available active channels count
     user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
     async with aiosqlite.connect(db_mgr.db_path) as db:
@@ -813,7 +908,6 @@ async def task_hub_select_type(callback: CallbackQuery, state: FSMContext, bot: 
             cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active' AND user_id = ?", (user_id,))
         active_count = (await cursor.fetchone())[0]
 
-    # Recreates layout matrix strictly identical to Photo 2 layout design
     wizard_text = (
         f"🚀 **Adv Campaign**\n"
         f"----------------------------------------\n"
@@ -848,7 +942,6 @@ async def task_hub_process_target(message: Message, state: FSMContext, bot: Bot)
     if task_type in ["join", "leave", "refer", "view", "speed"]:
         await finalize_task_creation(message, state, bot)
     elif "react" in task_type:
-        # Prompt for emoji reactions configuration workflow
         await state.update_data(selected_emojis=[], existing_reactions=[])
         await message.answer(
             "🎭 **Choose Emojis to Distribute:**\nSelect destination reaction expressions below:",
@@ -973,22 +1066,6 @@ async def view_referrals(callback: CallbackQuery, bot: Bot):
 async def handle_admin_panel(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     await callback.message.edit_text("🛠️ **Administrative Control Console**\nCommands:\n/addadmin <id> <limit>\n/removeadmin <id>\n/canceltasks", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]]))
-
-@router.callback_query(F.data == "backup_panel")
-async def backup_panel(callback: CallbackQuery, bot: Bot):
-    await callback.answer()
-    buttons = [[InlineKeyboardButton(text="📥 Download Raw DB Image", callback_data="export_db")], [InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]]
-    await callback.message.edit_text("💾 **Database Core Backups Exporter Hub**", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-@router.callback_query(F.data == "export_db")
-async def export_db(callback: CallbackQuery, bot: Bot):
-    await callback.answer()
-    try:
-        with open(db_mgr.db_path, "rb") as f:
-            file = BufferedInputFile(f.read(), filename="database_core_backup.db")
-        await callback.message.reply_document(file, caption="📂 SQLite Snapshot")
-    except Exception as e:
-        await callback.message.answer(f"❌ Error: {e}")
 
 @router.callback_query(F.data == "system_stats")
 async def system_stats(callback: CallbackQuery, bot: Bot):
