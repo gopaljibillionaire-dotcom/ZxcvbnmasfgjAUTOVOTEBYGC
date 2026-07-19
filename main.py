@@ -406,9 +406,12 @@ class TaskQueue:
                             async for dialog in client.iter_dialogs():
                                 if dialog.is_channel or dialog.is_group:
                                     try:
-                                        await client(functions.channels.LeaveChannelRequest(channel=dialog.input_peer))
+                                        # Use the explicit entity tracking object instead of raw payload wrappers
+                                        await client(functions.channels.LeaveChannelRequest(channel=dialog.entity))
                                         left_chats_count += 1
-                                        await asyncio.sleep(0.2)
+                                        await asyncio.sleep(0.3)
+                                    except FloodWaitError as fwe:
+                                        await asyncio.sleep(fwe.seconds)
                                     except Exception:
                                         pass
                             if left_chats_count == 0:
