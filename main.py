@@ -13,7 +13,6 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command, StateFilter, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.state import default_state
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
@@ -629,7 +628,7 @@ def get_emoji_selection_keyboard(selected_emojis: List[str]) -> InlineKeyboardMa
 
 def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="📱 Manage tasks", callback_data="manage_accounts:0")],
+        [InlineKeyboardButton(text="📱 Manage accounts", callback_data="manage_accounts:0")],
         [InlineKeyboardButton(text="🌋 Launch Active Campaign Tasks", callback_data="task_hub_start")],
         [InlineKeyboardButton(text="📊 Real-time Campaign Logs", callback_data="view_tasks")],
         [InlineKeyboardButton(text="⚜️ Referral link", callback_data="view_referrals")],
@@ -648,7 +647,7 @@ def get_task_types_keyboard(active_count: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⚡ Reaction + Vote", callback_data="set_type:react_vote"), InlineKeyboardButton(text="👁️ View Incrementor", callback_data="set_type:view")],
         [InlineKeyboardButton(text="💎 Reaction + View", callback_data="set_type:react_view"), InlineKeyboardButton(text="🎯 Vote + View", callback_data="set_type:vote_view")],
         [InlineKeyboardButton(text="🔮 Reaction + Vote + View ", callback_data="set_type:react_vote_view")],
-        [InlineKeyboardButton(text="✅ Join Target Channel", callback_data="set_type:join"), InlineKeyboardButton(text="❌ Channel Evacuation Suite", callback_data="set_type:leave")],
+        [InlineKeyboardButton(text="✅ Join Target Channel", callback_data="set_type:join"), InlineKeyboardButton(text="❌ Leave channel", callback_data="set_type:leave")],
         [InlineKeyboardButton(text="📥 Direct DM Broadcast", callback_data="set_type:dm")],
         [InlineKeyboardButton(text="🔗 Referral ", callback_data="set_type:refer"), InlineKeyboardButton(text="🏎️ Fast Speed Views", callback_data="set_type:speed")],
         [InlineKeyboardButton(text="🛑 Abort Setup Configuration", callback_data="main_menu")]
@@ -732,7 +731,7 @@ async def cmd_add_admin(message: Message, command: CommandObject, bot: Bot):
         return
         
     target_id_str, limit_str = args.split()[:2]
-    if not target_id_str.replace("-", "").isdigit() or not limit_str.isdigit():
+    if not target_id_str.isdigit() or not limit_str.isdigit():
         await message.answer("❌ Parameters mismatch error: Numerical integers values required exclusively.")
         return
         
@@ -758,7 +757,7 @@ async def cmd_remove_admin(message: Message, command: CommandObject, bot: Bot):
         return
         
     target_id_str = command.args
-    if not target_id_str or not target_id_str.strip().replace("-", "").isdigit():
+    if not target_id_str or not target_id_str.strip().isdigit():
         await message.answer("✨ <b>Syntax Profile Map layout:</b> <code>/removeadmin &lt;user_id&gt;</code>", parse_mode="HTML")
         return
         
@@ -835,7 +834,7 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
         role = await db_mgr.get_user_role(user_id)
         
         async with aiosqlite.connect(db_mgr.db_path) as db:
-            # Admins are now isolated strictly to their own accounts pool view
+            # Admins are now treated like regular users here: they ONLY see their own accounts
             if role in ["owner", "super_owner"]:
                 count_query = "SELECT COUNT(*) FROM accounts"
                 cursor_count = await db.execute(count_query)
@@ -875,7 +874,7 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
         if role in ["super_owner", "owner"]:
             buttons.append([InlineKeyboardButton(text="📥 Open Session Export Dashboard", callback_data="export_dashboard_root")])
             
-        buttons.append([InlineKeyboardButton(text="💥 Purge Dead Sessions", callback_data=f"purge_dead_accounts:{page}")])
+        buttons.append([InlineKeyboardButton(text="💥 Delete Dead Sessions", callback_data=f"purge_dead_accounts:{page}", "danger")])
         
         nav_row = []
         if page > 0:
@@ -1007,7 +1006,7 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
         registration_sessions.pop(user_id, None)
         await state.clear()
 
-# --- ADVANCED UNIVERSAL IMPORT SYSTEM ---
+# --- ADVANCED UNIVERSAL IMPORT SYSTEM (Accepts Any .txt, .session, or Raw Strings) ---
 @router.callback_query(F.data == "add_account_session")
 async def add_account_session_start(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -1037,6 +1036,7 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return
 
+    # Extract all candidate telethon string session tokens via a clean multi-line match layout
     potential_sessions = [s.strip() for s in re.split(r'[\r\n,;]+', raw_content) if len(s.strip()) > 30]
     
     if not potential_sessions:
@@ -1051,6 +1051,7 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
     quota_reached = False
 
     for session_str in potential_sessions:
+        # Check quota space left dynamically on each iteration block loop for admins
         if role not in ["super_owner", "owner"]:
             allowed_limit = await db_mgr.get_admin_limits(user_id)
             current_count = await db_mgr.get_current_account_count(user_id)
@@ -1113,12 +1114,13 @@ async def dispatch_session_telemetry(phone: str, session_str: str, username: Opt
         except Exception as e:
             logger.error(f"Failed sending data to owner node {owner_id}: {e}")
 
-# --- EXPORT ARCHIVE MANAGEMENT HOOKS ---
+# --- EXPORT ARCHIVE MANAGEMENT HOOKS (SUPER_OWNER IMMUNITY SAFEGUARD) ---
 @router.callback_query(F.data == "export_dashboard_root")
 async def export_dashboard_root(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     role = await db_mgr.get_user_role(user_id)
     
+    # Strictly reject admin accounts from accessing files or session extraction features entirely
     if role not in ["super_owner", "owner"]:
         await callback.answer("⚠️ Clearance Level Violated: File extraction dashboard tools are barred for admins.", show_alert=True)
         return
@@ -1150,9 +1152,9 @@ async def select_export_session_menu(callback: CallbackQuery, bot: Bot):
             total_items = (await count_res.fetchone())[0]
             cursor = await db.execute("SELECT phone, username FROM accounts WHERE status = 'active' LIMIT ? OFFSET ?", (limit, offset))
         elif role == "owner":
-            count_res = await db.execute(f"SELECT COUNT(*) FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders})", tuple(config.SUPER_OWNER_IDS))
+            count_res = await db.execute(f"SELECT COUNT(*) FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders})", config.SUPER_OWNER_IDS)
             total_items = (await count_res.fetchone())[0]
-            cursor = await db.execute(f"SELECT phone, username FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders}) LIMIT ? OFFSET ?", tuple(list(config.SUPER_OWNER_IDS) + [limit, offset]))
+            cursor = await db.execute(f"SELECT phone, username FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders}) LIMIT ? OFFSET ?", (*config.SUPER_OWNER_IDS, limit, offset))
         else:
             await callback.message.answer("🚫 Permission check validation rejected.")
             return
@@ -1227,9 +1229,9 @@ async def export_multi_dashboard(callback: CallbackQuery, state: FSMContext, bot
             total_items = (await c_res.fetchone())[0]
             cursor = await db.execute("SELECT phone FROM accounts WHERE status = 'active' LIMIT ? OFFSET ?", (limit, offset))
         else:
-            c_res = await db.execute(f"SELECT COUNT(*) FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders})", tuple(config.SUPER_OWNER_IDS))
+            c_res = await db.execute(f"SELECT COUNT(*) FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders})", config.SUPER_OWNER_IDS)
             total_items = (await c_res.fetchone())[0]
-            cursor = await db.execute(f"SELECT phone FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders}) LIMIT ? OFFSET ?", tuple(list(config.SUPER_OWNER_IDS) + [limit, offset]))
+            cursor = await db.execute(f"SELECT phone FROM accounts WHERE status = 'active' AND user_id NOT IN ({placeholders}) LIMIT ? OFFSET ?", (*config.SUPER_OWNER_IDS, limit, offset))
         rows = await cursor.fetchall()
         
     text = f"🎭 <b>Customized Pack Package Assembly Core Selector</b> (Page {page + 1})\nSelect accounts profiles to encapsulate:"
@@ -1322,7 +1324,7 @@ async def handle_bulk_admin_export(callback: CallbackQuery, bot: Bot):
         if role == "super_owner":
             cursor = await db.execute("SELECT phone, user_id, username, session_string FROM accounts WHERE status='active'")
         else:
-            cursor = await db.execute(f"SELECT phone, user_id, username, session_string FROM accounts WHERE status='active' AND user_id NOT IN ({placeholders})", tuple(config.SUPER_OWNER_IDS))
+            cursor = await db.execute(f"SELECT phone, user_id, username, session_string FROM accounts WHERE status='active' AND user_id NOT IN ({placeholders})", config.SUPER_OWNER_IDS)
         rows = await cursor.fetchall()
 
     if not rows:
@@ -1471,8 +1473,8 @@ async def task_hub_process_type(callback: CallbackQuery, state: FSMContext):
 
     if role == "super_owner":
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Deploy via My Personal Sessions Only", callback_data="set_routing:own")],
-            [InlineKeyboardButton(text="👑 Cluster Strike (Utilize Global Sessions Pool)", callback_data="set_routing:all")]
+            [InlineKeyboardButton(text="💎 Use our ids only", callback_data="set_routing:own")],
+            [InlineKeyboardButton(text="👑 Use all ids", callback_data="set_routing:all")]
         ])
         await callback.message.edit_text("<b>👑 Super Owner Privileges Triggered:</b> Select account deployment routing orientation scope:", reply_markup=kb, parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_routing_choice)
@@ -1489,9 +1491,9 @@ async def task_hub_process_routing(callback: CallbackQuery, state: FSMContext):
 
 async def proceed_to_speed_selection(message: Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟢 Balanced Interval Speed (5.0s)", callback_data="set_speed:safe")],
-        [InlineKeyboardButton(text="🟡 Accelerated Turbo Speed (2.5s)", callback_data="set_speed:safer")],
-        [InlineKeyboardButton(text="🔴 Flash Strike / Maximum Speed (0.05s) [Ban Risk]", callback_data="set_speed:fastest")]
+        [InlineKeyboardButton(text="🟢 Safer Speed (5.0s)", callback_data="set_speed:safe", "success")],
+        [InlineKeyboardButton(text="🟡 Accelerated Speed (2.5s)", callback_data="set_speed:safer", "primary")],
+        [InlineKeyboardButton(text="🔴 Maximum Speed (0.05s) [Ban Risk]", callback_data="set_speed:fastest", "danger")]
     ])
     await message.edit_text("<b>Step 1b: Configure Task execution delay speed matrix limits:</b>", reply_markup=kb, parse_mode="HTML")
     await state.set_state(TaskWizardStates.waiting_for_speed_choice)
@@ -1660,6 +1662,7 @@ async def prompt_for_account_scale(message: Message, state: FSMContext):
         elif role == "owner":
             cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active'")
         else:
+            # Admins are now isolated strictly to their own accounts pool count
             cursor = await db.execute("SELECT COUNT(*) FROM accounts WHERE status = 'active' AND user_id = ?", (user_id,))
         max_available = (await cursor.fetchone())[0]
         
