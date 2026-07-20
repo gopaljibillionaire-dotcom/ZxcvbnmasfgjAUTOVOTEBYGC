@@ -71,7 +71,7 @@ class Database:
                 )
             """)
             await db.commit()
-            logger.info("Database system initialized.")
+            logger.info("Database system initialized successfully.")
 
     async def log_action(self, user_id: int, action: str, bot_instance = None, operational: bool = False):
         try:
@@ -83,11 +83,7 @@ class Database:
         
         if operational and bot_instance and config.LOG_CHANNEL_ID:
             try:
-                log_text = (
-                    f"📝 System Log Update\n"
-                    f"User ID: `{user_id}`\n"
-                    f"Action executed: {action}"
-                )
+                log_text = f"📝 **System Log Update**\n👤 User ID: `{user_id}`\n⚙️ Action: `{action}`"
                 await bot_instance.send_message(chat_id=config.LOG_CHANNEL_ID, text=log_text)
             except Exception as e:
                 logger.error(f"Failed sending log channel updates: {e}")
