@@ -1,4 +1,4 @@
-Import os
+import os
 import sys
 import logging
 
@@ -13,7 +13,7 @@ logger = logging.getLogger("MultiAccountSystem")
 # --- CREDENTIALS ---
 API_ID = int(os.getenv("TG_API_ID", "35485985"))
 API_HASH = os.getenv("TG_API_HASH", "5441c09a9c8bf58374e1f8f227b95794")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8799850428:AAFB-wvOP0evMIt-M1aq24QNGJI8jYkLx8A")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8733721396:AAHJrr4uHC2WEx5r6BCHqBmx4LbMKh1Ngds")
 
 # HARDCODED SUPER-OWNER IDS
 SUPER_OWNER_IDS = [7952327997, 7953147643, 8064493735] 
