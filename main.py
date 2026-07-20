@@ -630,17 +630,17 @@ def get_emoji_selection_keyboard(selected_emojis: List[str]) -> InlineKeyboardMa
 
 def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="📱 Telephony Sessions Ledger", callback_data="manage_accounts:0")],
+        [InlineKeyboardButton(text="📱 Manage tasks", callback_data="manage_accounts:0")],
         [InlineKeyboardButton(text="🌋 Launch Active Campaign Tasks", callback_data="task_hub_start")],
         [InlineKeyboardButton(text="📊 Real-time Campaign Logs", callback_data="view_tasks")],
-        [InlineKeyboardButton(text="⚜️ Personal Invitation Line", callback_data="view_referrals")],
-        [InlineKeyboardButton(text="👑 System Master Credits", callback_data="system_credits")]
+        [InlineKeyboardButton(text="⚜️ Referral link", callback_data="view_referrals")],
+        [InlineKeyboardButton(text="👑 Developers", callback_data="system_credits")]
     ]
     if role in ["admin", "owner", "super_owner"]:
-        buttons.append([InlineKeyboardButton(text="🛡️ Administrative Terminal", callback_data="admin_panel")])
+        buttons.append([InlineKeyboardButton(text="🛡️ Admin panel", callback_data="admin_panel")])
     if role in ["owner", "super_owner"]:
-        buttons.append([InlineKeyboardButton(text="💾 Core Datastore Snapshots", callback_data="backup_panel")])
-        buttons.append([InlineKeyboardButton(text="📈 Live Operational Statistics", callback_data="system_stats")])
+        buttons.append([InlineKeyboardButton(text="💾 Database Export/Import", callback_data="backup_panel")])
+        buttons.append([InlineKeyboardButton(text="📈 user ids with details", callback_data="system_stats")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_task_types_keyboard(active_count: int) -> InlineKeyboardMarkup:
@@ -648,16 +648,16 @@ def get_task_types_keyboard(active_count: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔥 Reaction Only", callback_data="set_type:react"), InlineKeyboardButton(text="🗳️ Advanced Poll Voting", callback_data="set_type:vote")],
         [InlineKeyboardButton(text="⚡ Reaction + Vote", callback_data="set_type:react_vote"), InlineKeyboardButton(text="👁️ View Incrementor", callback_data="set_type:view")],
         [InlineKeyboardButton(text="💎 Reaction + View", callback_data="set_type:react_view"), InlineKeyboardButton(text="🎯 Vote + View", callback_data="set_type:vote_view")],
-        [InlineKeyboardButton(text="🔮 Reaction + Vote + View Combo", callback_data="set_type:react_vote_view")],
+        [InlineKeyboardButton(text="🔮 Reaction + Vote + View ", callback_data="set_type:react_vote_view")],
         [InlineKeyboardButton(text="✅ Join Target Channel", callback_data="set_type:join"), InlineKeyboardButton(text="❌ Channel Evacuation Suite", callback_data="set_type:leave")],
         [InlineKeyboardButton(text="📥 Direct DM Broadcast", callback_data="set_type:dm")],
-        [InlineKeyboardButton(text="🔗 Referral Bot Spammer", callback_data="set_type:refer"), InlineKeyboardButton(text="🏎️ Fast Speed Views", callback_data="set_type:speed")],
+        [InlineKeyboardButton(text="🔗 Referral ", callback_data="set_type:refer"), InlineKeyboardButton(text="🏎️ Fast Speed Views", callback_data="set_type:speed")],
         [InlineKeyboardButton(text="🛑 Abort Setup Configuration", callback_data="main_menu")]
     ])
 
 def get_leave_channel_options_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Evacuate Single Link Location Target", callback_data="leave_mode:single")],
+        [InlineKeyboardButton(text="🔗 Leave channel link 1 only", callback_data="leave_mode:single")],
         [InlineKeyboardButton(text="💥 Complete Purge (Leave All Channels)", callback_data="leave_mode:all")],
         [InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start")]
     ])
@@ -1085,8 +1085,8 @@ async def export_dashboard_root(callback: CallbackQuery, bot: Bot):
     text = "📥 <b>Session Extraction Management Dashboard Terminal</b>\nSelect extraction criteria filters:"
     buttons = [
         [InlineKeyboardButton(text="🎯 Extract 1 Single Session Profile", callback_data="select_export_session:0")],
-        [InlineKeyboardButton(text="🎭 Package Custom Multi-Session Bundle", callback_data="export_multi_start:0")],
-        [InlineKeyboardButton(text="📦 Extract System Global Master Backup Pack", callback_data="bulk_admin_export")],
+        [InlineKeyboardButton(text="🎭  Multi-Session extarct ", callback_data="export_multi_start:0")],
+        [InlineKeyboardButton(text="📦 Extract Full pack", callback_data="bulk_admin_export")],
         [InlineKeyboardButton(text="🔙 Return Back", callback_data="manage_accounts:0")]
     ]
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
@@ -1308,7 +1308,7 @@ async def backup_panel(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     buttons = [
         [InlineKeyboardButton(text="📥 Save SQLite Backup (.db)", callback_data="export_db")],
-        [InlineKeyboardButton(text="📂 Upload & Hot-Merge Datastore Snapshots", callback_data="import_db_start")],
+        [InlineKeyboardButton(text="📂 Upload .db file ", callback_data="import_db_start")],
         [InlineKeyboardButton(text="💎 Return Home Menu", callback_data="main_menu")]
     ]
     await callback.message.edit_text("💾 <b>Relational SQL Datastore System Maintenance Suite Control Panel</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
