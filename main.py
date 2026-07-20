@@ -874,7 +874,7 @@ async def list_user_accounts(callback: CallbackQuery, bot: Bot):
         if role in ["super_owner", "owner"]:
             buttons.append([InlineKeyboardButton(text="📥 Open Session Export Dashboard", callback_data="export_dashboard_root")])
             
-        buttons.append([InlineKeyboardButton(text="💥 Delete Dead Sessions", callback_data=f"purge_dead_accounts:{page}", "danger")])
+        buttons.append([InlineKeyboardButton(text="💥 Delete Dead Sessions", callback_data=f"purge_dead_accounts:{page}")])
         
         nav_row = []
         if page > 0:
@@ -1491,9 +1491,9 @@ async def task_hub_process_routing(callback: CallbackQuery, state: FSMContext):
 
 async def proceed_to_speed_selection(message: Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟢 Safer Speed (5.0s)", callback_data="set_speed:safe", "success")],
-        [InlineKeyboardButton(text="🟡 Accelerated Speed (2.5s)", callback_data="set_speed:safer", "primary")],
-        [InlineKeyboardButton(text="🔴 Maximum Speed (0.05s) [Ban Risk]", callback_data="set_speed:fastest", "danger")]
+        [InlineKeyboardButton(text="🟢 Safer Speed (5.0s)", callback_data="set_speed:safe")],
+        [InlineKeyboardButton(text="🟡 Accelerated Speed (2.5s)", callback_data="set_speed:safer")],
+        [InlineKeyboardButton(text="🔴 Maximum Speed (0.05s) [Ban Risk]", callback_data="set_speed:fastest")]
     ])
     await message.edit_text("<b>Step 1b: Configure Task execution delay speed matrix limits:</b>", reply_markup=kb, parse_mode="HTML")
     await state.set_state(TaskWizardStates.waiting_for_speed_choice)
