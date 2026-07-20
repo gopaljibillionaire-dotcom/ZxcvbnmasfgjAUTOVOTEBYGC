@@ -10,12 +10,12 @@ from database import db_mgr, decrypt_data
 from handlers import router, task_queue, set_bot_username
 
 async def verify_saved_sessions():
-    logger.info("Verifying all active account database sessions...")
+    logger.info("⚡ Synchronizing and verifying account sessions...")
     import aiosqlite
     async with aiosqlite.connect(db_mgr.db_path) as db:
         accounts = await (await db.execute("SELECT phone, session_string FROM accounts WHERE status = 'active'")).fetchall()
     
-    semaphore = asyncio.Semaphore(10)
+    semaphore = asyncio.Semaphore(15)
     async def check_account(phone, enc_session):
         async with semaphore:
             try:
@@ -26,7 +26,8 @@ async def verify_saved_sessions():
                         await db_conn.execute("UPDATE accounts SET status = 'dead' WHERE phone = ?", (phone,))
                         await db_conn.commit()
                 await client.disconnect()
-            except Exception: pass
+            except Exception:
+                pass
                 
     await asyncio.gather(*(check_account(p, s) for p, s in accounts))
 
@@ -35,7 +36,7 @@ async def main():
     await verify_saved_sessions()
     
     if not config.BOT_TOKEN:
-        logger.error("Missing BOT_TOKEN in config configuration profile!")
+        logger.error("❌ Critical Failure: Missing BOT_TOKEN in configuration mapping!")
         return
         
     bot = Bot(token=config.BOT_TOKEN)
@@ -47,6 +48,7 @@ async def main():
     
     worker_task = asyncio.create_task(task_queue.start_worker())
     try:
+        logger.info(f"💎 Premium Terminal Engine Online - @{bot_info.username}")
         await dp.start_polling(bot)
     finally:
         worker_task.cancel()
@@ -56,4 +58,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot execution successfully stopped.")
+        logger.info("🛑 Bot runtime safely terminated.")
