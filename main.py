@@ -29,7 +29,8 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PasswordHashInvalidError,
-    FloodWaitError
+    FloodWaitError,
+    UserAlreadyParticipantError
 )
 
 # SQLite
@@ -317,7 +318,6 @@ class TaskQueue:
                 query = "SELECT phone, session_string FROM accounts WHERE status = 'active'"
                 cursor = await db.execute(query)
             else:
-                # Regular user or assigned user: Fetch owned accounts OR assigned accounts
                 query = """
                     SELECT phone, session_string FROM accounts 
                     WHERE status = 'active' AND (
@@ -404,13 +404,16 @@ class TaskQueue:
                                 updates = await client(functions.channels.JoinChannelRequest(channel=parsed_channel or parsed_target))
                                 if hasattr(updates, 'chats') and updates.chats:
                                     joined_updates_peer = updates.chats[0]
+                        except UserAlreadyParticipantError:
+                            # Skip re-joining process if account is already joined
+                            pass
                         except Exception as join_err:
                             if "USER_ALREADY_PARTICIPANT" not in str(join_err):
                                 failed_ids.append((phone, f"Failed to join chat/channel: {str(join_err)}"))
                                 failure_counter += 1
                                 return
 
-                    target_peer = joined_updates_peer or parsed_target
+                    target_peer = joined_updates_peer or parsed_channel or parsed_target
 
                     if do_view and msg_id:
                         try:
@@ -434,6 +437,7 @@ class TaskQueue:
                         except Exception as react_err:
                             try:
                                 peer_entity = await client.get_input_entity(target_peer)
+                                # React fallback on existing post reaction options
                                 await client(functions.messages.SendReactionRequest(
                                     peer=peer_entity,
                                     msg_id=msg_id,
@@ -525,8 +529,13 @@ class TaskQueue:
                                 return
                         else:
                             try:
-                                resolved_entity = await client.get_input_entity(target_peer)
-                                await client(functions.channels.LeaveChannelRequest(channel=resolved_entity))
+                                if is_target_private or is_channel_private or "+ " in str(target) or "/+" in str(target) or "joinchat/" in str(target):
+                                    invite_hash = parsed_channel if is_channel_private else parsed_target
+                                    chat_entity = await client.get_entity(target_peer)
+                                    await client(functions.channels.LeaveChannelRequest(channel=chat_entity))
+                                else:
+                                    resolved_entity = await client.get_input_entity(target_peer)
+                                    await client(functions.channels.LeaveChannelRequest(channel=resolved_entity))
                             except Exception as leave_err:
                                 failed_ids.append((phone, f"Leave channel failed: {str(leave_err)}"))
                                 failure_counter += 1
@@ -718,7 +727,6 @@ def get_main_keyboard(role: str) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="📱 Manage accounts", callback_data="manage_accounts:0", style="primary")],
         [InlineKeyboardButton(text="🌋 Launch Active Campaign Tasks", callback_data="task_hub_start", style="success")],
-        [InlineKeyboardButton(text="📊 Real-time Campaign Logs", callback_data="view_tasks", style="primary")],
         [InlineKeyboardButton(text="⚜️ Referral link", callback_data="view_referrals", style="primary")],
         [InlineKeyboardButton(text="👑 Developers", callback_data="system_credits", style="primary")]
     ]
@@ -743,7 +751,7 @@ def get_task_types_keyboard(active_count: int) -> InlineKeyboardMarkup:
 
 def get_leave_channel_options_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Leave channel link 1 only", callback_data="leave_mode:single", style="primary")],
+        [InlineKeyboardButton(text="🔗 Leave channel link (Public/Private)", callback_data="leave_mode:single", style="primary")],
         [InlineKeyboardButton(text="💥 Complete Purge (Leave All Channels)", callback_data="leave_mode:all", style="danger")],
         [InlineKeyboardButton(text="🔙 Return Back", callback_data="task_hub_start", style="primary")]
     ])
@@ -804,7 +812,7 @@ async def cmd_cancel_tasks(message: Message, bot: Bot):
         await db.commit()
     await message.answer(f"✨ <b>Task Termination Loop Completed!</b> Successfully cancelled <code>{killed_count}</code> pending or active task threads.")
 
-# --- SUPER OWNER EXCLUSIVE: GRANT & REVOKE 20 ACCOUNT IDS ACCESS ---
+# --- SUPER OWNER EXCLUSIVE: GRANT & REVOKE ACCOUNT ACCESS ---
 @router.message(Command("grantaccess"))
 async def cmd_grant_access(message: Message, command: CommandObject, bot: Bot):
     user_id = message.from_user.id
@@ -1654,7 +1662,7 @@ async def task_hub_process_speed(callback: CallbackQuery, state: FSMContext):
         )
         await state.set_state(TaskWizardStates.waiting_for_leave_choice)
     elif "react" in task_type or "vote" in task_type or task_type in ["view", "speed"]:
-        await callback.message.edit_text("<b>Step 2: Provide targeted public handle destination or private link reference (e.g. @channelname or -100xxxxx):</b>", parse_mode="HTML")
+        await callback.message.edit_text("<b>Step 2: Provide targeted public handle destination or private link reference (e.g. @channelname or https://t.me/c/... or +invitehash):</b>", parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_channel_link)
     elif task_type == "refer":
         await callback.message.edit_text("<b>Step 2: Input target referral link parameter query string value (Example: https://t.me/Bot?start=123):</b>", parse_mode="HTML")
@@ -1673,7 +1681,7 @@ async def task_hub_process_leave_choice(callback: CallbackQuery, state: FSMConte
         await state.update_data(target="ALL CHANNELS")
         await prompt_for_account_scale(callback.message, state)
     else:
-        await callback.message.edit_text("<b>Step 3: Paste public link, private channel invite code, or numeric channel ID:</b>", parse_mode="HTML")
+        await callback.message.edit_text("<b>Step 3: Paste public link, private channel invite code/hash, or numeric channel ID:</b>", parse_mode="HTML")
         await state.set_state(TaskWizardStates.waiting_for_post_link)
 
 @router.message(StateFilter(TaskWizardStates.waiting_for_channel_link))
@@ -1883,20 +1891,6 @@ async def finalize_task_creation(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
 # --- REPORTS & STATS INTERFACES ---
-@router.callback_query(F.data == "view_tasks")
-async def view_tasks(callback: CallbackQuery, bot: Bot):
-    user_id = callback.from_user.id
-    await callback.answer()
-    role = await db_mgr.get_user_role(user_id)
-    async with aiosqlite.connect(db_mgr.db_path) as db:
-        cursor = await db.execute("SELECT task_id, type, status, progress FROM tasks ORDER BY task_id DESC LIMIT 10" if role in ["owner", "super_owner"] else "SELECT task_id, type, status, progress FROM tasks WHERE creator_id = ? ORDER BY task_id DESC LIMIT 10", (user_id,))
-        rows = await cursor.fetchall()
-
-    text = "📊 <b>Historical Campaign Event Feed Records Index Matrix</b>\n\n"
-    for r in rows:
-        text += f"🔹 <b>Task Sheet:</b> <code>#{r[0]}</code> (Type: <code>{r[1].upper()}</code>)\nState tracking: <b>{r[2]}</b> | Metrics: <code>{r[3]}</code>\nTo call full details map command layout: <code>/taskreport_{r[0]}</code>\n\n"
-    await callback.message.edit_text(text if rows else "No active campaign tracking logs catalogued inside runtime registers.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Return Back", callback_data="main_menu", style="primary")]]), parse_mode="HTML")
-
 @router.message(F.text.startswith("/taskreport_"))
 async def cmd_task_report(message: Message, bot: Bot):
     user_id = message.from_user.id
